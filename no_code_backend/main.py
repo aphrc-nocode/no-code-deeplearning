@@ -40,7 +40,6 @@ from mlflow_utils import (
 from data_loaders import create_dataloaders
 
 
-
 # ==================== Models & Schemas ====================
 
 class TaskType(str, Enum):
@@ -114,9 +113,6 @@ class TrainingJob(BaseModel):
     model_path: Optional[str] = None
     logs: List[str] = []
 
-# ==================== Core Pipeline Components ====================
-
-# ImageClassificationPipeline is now imported from pipelines.image_classification_pipeline
 
 # ==================== Pipeline Factory ====================
 
