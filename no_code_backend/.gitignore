@@ -8,6 +8,7 @@ __pycache__/
 datasets/
 logs/
 test_data/
+temp/
 
 # Virtual environments
 venv/
