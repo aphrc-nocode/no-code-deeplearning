@@ -1,0 +1,38 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Project specific directories to ignore
+datasets/
+logs/
+models/
+test_data/
+
+# Virtual environments
+venv/
+env/
+.env/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git related
+.git/
+.gitignore
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
