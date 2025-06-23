@@ -21,8 +21,8 @@ async def run_image_classification_example(dataset_path: str):
         task_type=TaskType.IMAGE_CLASSIFICATION,
         architecture=ModelArchitecture.RESNET18,
         num_classes=2,
-        batch_size=4,
-        epochs=2,  # Use small number of epochs for example
+        batch_size=8,
+        epochs=10,  # Use small number of epochs for example
         learning_rate=0.001,
         image_size=(224, 224),
         augmentation_enabled=True,
@@ -156,7 +156,7 @@ async def main():
     
     # Use the same test dataset for all examples
     # In a real scenario, you would use appropriate datasets for each task
-    test_dataset_path = "test_data"
+    test_dataset_path = "/home/alvin/demo"
     
     # Ensure test dataset exists
     if not os.path.exists(test_dataset_path):
