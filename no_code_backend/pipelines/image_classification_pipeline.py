@@ -212,6 +212,9 @@ class ImageClassificationPipeline(BasePipeline):
                     class_names=classes,
                     class_counts=class_counts
                 )
+            else:
+                # Initialize metrics_dict as empty if no validation data
+                metrics_dict = {}
             
             # Save best model
             if best_model_state:
