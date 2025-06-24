@@ -2,18 +2,23 @@
 Pipeline for image classification tasks.
 This module implements the BasePipeline interface for image classification.
 """
+from typing import Dict, Any, List, Optional, Tuple
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim import lr_scheduler
+import numpy as np
+import torchvision
+import time
 import os
 import mlflow
-from typing import Dict, Any, List, Optional, Tuple
-from pathlib import Path
+
 
 from pipelines.base_pipeline import BasePipeline
 from models.classification import model_factory
 from datasets_module.classification.dataloaders import create_dataloaders
-from metrics.classification.metrics import calculate_classification_metrics
+from metrics.classification.metrics import calculate_classification_metrics, get_confusion_matrix, generate_classification_report
 
 class ImageClassificationPipeline(BasePipeline):
     """Pipeline for image classification tasks"""
@@ -25,13 +30,32 @@ class ImageClassificationPipeline(BasePipeline):
             from mlflow_utils import start_run, log_metrics, log_model, end_run
             self.run_id = start_run(job_id, self.config.dict())
             
-            # Create model and setup training
+            # Create model with transfer learning approach
             model = self.create_model()
+            
+            # Setup training components
             criterion = nn.CrossEntropyLoss()
-            optimizer = optim.Adam(model.parameters(), lr=self.config.learning_rate)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=3
-            )
+            
+            # Handle different optimization strategies based on whether we want to fine-tune or use as feature extractor
+            if self.config.feature_extraction_only:
+                # Feature extraction: freeze all layers except the final layer
+                for param in model.parameters():
+                    param.requires_grad = False
+                
+                # Only optimize the final fully connected layer parameters
+                if self.config.architecture.startswith('resnet'):
+                    optimizer = optim.SGD(model.fc.parameters(), lr=self.config.learning_rate, momentum=0.9)
+                elif self.config.architecture.startswith('vgg'):
+                    optimizer = optim.SGD(model.classifier[6].parameters(), lr=self.config.learning_rate, momentum=0.9)
+                else:
+                    # Default for other models
+                    optimizer = optim.SGD(model.parameters(), lr=self.config.learning_rate, momentum=0.9)
+            else:
+                # Fine-tuning: optimize all parameters
+                optimizer = optim.SGD(model.parameters(), lr=self.config.learning_rate, momentum=0.9)
+            
+            # Learning rate scheduler
+            scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
             
             # Log optimizer configuration
             log_metrics({
@@ -79,8 +103,17 @@ class ImageClassificationPipeline(BasePipeline):
             class_dist_path = create_class_distribution_plot(class_counts)
             mlflow.log_artifact(class_dist_path, "visualizations")
             
+            # We'll use MLflow for model storage primarily
+            # Local directory only used as fallback if MLflow fails
+            model_dir = Path(f"models/{job_id}")
+            model_dir.mkdir(exist_ok=True, parents=True)
+            best_model_path = None
+            
             # Training loop
+            since = time.time()
             for epoch in range(self.config.epochs):
+                await self._update_job_log(job_id, f"Epoch {epoch+1}/{self.config.epochs}")
+                
                 # Training phase
                 model.train()
                 train_loss = 0.0
@@ -90,18 +123,20 @@ class ImageClassificationPipeline(BasePipeline):
                 for batch_idx, (data, targets) in enumerate(train_loader):
                     data, targets = data.to(self.device), targets.to(self.device)
                     
-                    # Forward pass
+                    # Zero the parameter gradients
+                    optimizer.zero_grad()
+                    
+                    # Forward pass with gradient tracking
                     outputs = model(data)
                     loss = criterion(outputs, targets)
                     
                     # Backward and optimize
-                    optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
                     
                     # Update metrics
                     train_loss += loss.item()
-                    _, predicted = outputs.max(1)
+                    _, predicted = torch.max(outputs, 1)
                     total += targets.size(0)
                     correct += predicted.eq(targets).sum().item()
                     
@@ -114,12 +149,18 @@ class ImageClassificationPipeline(BasePipeline):
                             f"Loss: {loss.item():.4f}"
                         )
                 
-                train_loss /= len(train_loader)
+                train_loss = train_loss / len(train_loader)
                 train_acc = 100.0 * correct / total
                 
                 # Store metrics for visualization
                 train_losses.append(train_loss)
                 train_accs.append(train_acc)
+                
+                # Log epoch metrics
+                epoch_metrics = {
+                    f"train_loss_epoch_{epoch}": train_loss,
+                    f"train_acc_epoch_{epoch}": train_acc / 100.0,  # Convert to 0-1 range
+                }
                 
                 # Validation phase
                 val_loss = 0.0
@@ -138,130 +179,243 @@ class ImageClassificationPipeline(BasePipeline):
                     with torch.no_grad():
                         for data, targets in val_loader:
                             data, targets = data.to(self.device), targets.to(self.device)
+                            
+                            # Forward pass without gradients
                             outputs = model(data)
                             loss = criterion(outputs, targets)
                             
+                            # Update metrics
                             val_loss += loss.item()
-                            _, predicted = outputs.max(1)
+                            _, predicted = torch.max(outputs, 1)
                             val_total += targets.size(0)
                             val_correct += predicted.eq(targets).sum().item()
                             
-                            # Store predictions and targets for final epoch
+                            # Store for final confusion matrix
                             if epoch == self.config.epochs - 1:
                                 all_preds.append(predicted.cpu())
                                 all_targets.append(targets.cpu())
                                 all_scores.append(torch.softmax(outputs, dim=1).cpu())
                     
-                    val_loss /= len(val_loader)
+                    val_loss = val_loss / len(val_loader)
                     val_acc = 100.0 * val_correct / val_total
                     
                     # Store metrics for visualization
                     val_losses.append(val_loss)
                     val_accs.append(val_acc)
                     
-                    # Update learning rate based on validation loss
-                    scheduler.step(val_loss)
+                    # Log validation metrics
+                    epoch_metrics.update({
+                        f"val_loss_epoch_{epoch}": val_loss,
+                        f"val_acc_epoch_{epoch}": val_acc / 100.0,  # Convert to 0-1 range
+                    })
                     
-                    # Early stopping based on validation metrics
+                    # Check for improvement
+                    improved = False
                     if self.config.early_stopping:
                         if val_loss < best_loss:
                             best_loss = val_loss
+                            improved = True
+                        if val_acc > best_acc:
                             best_acc = val_acc
-                            best_model_state = model.state_dict()
+                            improved = True
+                            
+                        if improved:
                             patience_counter = 0
+                            best_model_state = model.state_dict()
+                            
+                            # Log best model checkpoint to MLflow
+                            mlflow.pytorch.log_state_dict(model.state_dict(), "best_model_checkpoint")
+                            
+                            # Also log metadata about this checkpoint
+                            checkpoint_metadata = {
+                                'epoch': epoch,
+                                'loss': val_loss,
+                                'accuracy': val_acc,
+                            }
+                            mlflow.log_dict(checkpoint_metadata, "best_model_metadata.json")
+                            
+                            await self._update_job_log(job_id, f"Model improved, saved checkpoint at epoch {epoch+1}")
                         else:
                             patience_counter += 1
-                            if patience_counter >= self.config.patience:
-                                await self._update_job_log(job_id, f"Early stopping at epoch {epoch+1}")
-                                break
-                else:
-                    # If no validation set, use training metrics
-                    if train_loss < best_loss:
-                        best_loss = train_loss
-                        best_acc = train_acc
-                        best_model_state = model.state_dict()
-                        patience_counter = 0
-                    else:
-                        patience_counter += 1
-                        if patience_counter >= self.config.patience and self.config.early_stopping:
-                            await self._update_job_log(job_id, f"Early stopping at epoch {epoch+1}")
+                            
+                        # Early stopping check
+                        if patience_counter >= self.config.patience:
+                            await self._update_job_log(job_id, f"Early stopping triggered at epoch {epoch+1}")
                             break
-            
-            # Create visualization plots
-            from mlflow_utils import log_training_visualizations, log_evaluation_visualizations
-            
-            # Log training curves
-            log_training_visualizations(train_losses, train_accs, val_losses, val_accs)
-            
-            # Create and log confusion matrix if validation data is available
-            if val_loader and len(all_preds) > 0:
-                # Concatenate all predictions and targets
-                all_preds = torch.cat(all_preds)
-                all_targets = torch.cat(all_targets)
-                all_scores = torch.cat(all_scores)
+                else:
+                    # If no validation, log the latest model state to MLflow
+                    mlflow.pytorch.log_state_dict(model.state_dict(), f"checkpoint_epoch_{epoch}")
+                    
+                    # Also log metadata about this checkpoint
+                    checkpoint_metadata = {
+                        'epoch': epoch,
+                        'loss': train_loss,
+                        'accuracy': train_acc,
+                    }
+                    mlflow.log_dict(checkpoint_metadata, f"checkpoint_epoch_{epoch}_metadata.json")
                 
-                # Calculate additional classification metrics
-                metrics_dict = calculate_classification_metrics(all_targets.numpy(), all_preds.numpy(), all_scores.numpy())
-                log_metrics(metrics_dict)
+                # Step the scheduler
+                if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(val_loss if val_loader else train_loss)
+                else:
+                    scheduler.step()
                 
-                # Log evaluation visualizations
-                log_evaluation_visualizations(
-                    all_targets, 
-                    all_preds, 
-                    all_scores,
-                    class_names=classes,
-                    class_counts=class_counts
+                # Log metrics for this epoch
+                log_metrics(epoch_metrics)
+                
+                # Log epoch summary
+                await self._update_job_log(
+                    job_id,
+                    f"Epoch {epoch+1}/{self.config.epochs} - "
+                    f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% - "
+                    + (f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%" if val_loader else "")
                 )
-            else:
-                # Initialize metrics_dict as empty if no validation data
-                metrics_dict = {}
             
-            # Save best model
-            if best_model_state:
-                model.load_state_dict(best_model_state)
-            
-            # Save the model
-            os.makedirs("models", exist_ok=True)
-            model_path = f"models/{job_id}.pth"
-            
-            # Save only the necessary components
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'config': {k: v for k, v in self.config.dict().items()},
-                'class_to_idx': class_to_idx
-            }, model_path)
-            
-            # Log final model to MLflow
-            log_model(
-                model=model,
-                model_path=model_path,
-                class_to_idx=class_to_idx,
-                config=self.config.dict()
+            # Training complete
+            time_elapsed = time.time() - since
+            await self._update_job_log(
+                job_id,
+                f"Training complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s"
             )
+            
+            # Load best model if early stopping was used
+            if self.config.early_stopping and best_model_state is not None:
+                model.load_state_dict(best_model_state)
+                await self._update_job_log(job_id, "Loaded best model from checkpoints")
+            elif self.config.early_stopping:
+                # Try to get best model from MLflow
+                try:
+                    best_model_dict = mlflow.pytorch.load_state_dict("best_model_checkpoint")
+                    model.load_state_dict(best_model_dict)
+                    await self._update_job_log(job_id, "Loaded best model from MLflow")
+                except Exception as e:
+                    await self._update_job_log(job_id, f"Warning: Could not load best model from MLflow: {str(e)}")
+            
+            # Final evaluation and visualizations
+            if len(train_losses) > 0:
+                from visualization_utils import create_loss_curve, create_accuracy_curve
+                
+                # Loss curve
+                loss_curve_path = create_loss_curve(
+                    train_losses, 
+                    val_losses if val_loader else None
+                )
+                mlflow.log_artifact(loss_curve_path, "visualizations")
+                
+                # Accuracy curve
+                acc_curve_path = create_accuracy_curve(
+                    train_accs, 
+                    val_accs if val_loader else None
+                )
+                mlflow.log_artifact(acc_curve_path, "visualizations")
+            
+            # Create final confusion matrix if validation data was used
+            if val_loader and all_preds and all_targets:
+                from visualization_utils import create_confusion_matrix
+                
+                # Concatenate lists
+                all_preds = torch.cat(all_preds).numpy()
+                all_targets = torch.cat(all_targets).numpy()
+                all_scores = torch.cat(all_scores).numpy()
+                
+                # Create and log confusion matrix
+                cm_path = create_confusion_matrix(
+                    all_targets, 
+                    all_preds,
+                    class_names=classes,
+                    title="Validation Confusion Matrix"
+                )
+                mlflow.log_artifact(cm_path, "visualizations")
+                
+                # Calculate and log final metrics
+                final_metrics = calculate_classification_metrics(all_targets, all_preds, all_scores)
+                log_metrics({"final_" + k: v for k, v in final_metrics.items()})
+            
+            # Create the target directory for MLflow models
+            mlflow_models_dir = Path("logs/mlflow/models")
+            mlflow_models_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save class mapping separately for easier loading
+            class_mapping_path = mlflow_models_dir / f"{job_id}_class_mapping.json"
+            import json
+            with open(class_mapping_path, 'w') as f:
+                json.dump(class_to_idx, f)
+            
+            # Log model to MLflow
+            log_model(model, "model", {
+                'architecture': self.config.architecture,
+                'num_classes': self.config.num_classes,
+                'class_to_idx': class_to_idx,
+                'input_size': self.config.image_size
+            })
+            
+            # Get MLflow run info to use as model path
+            run_info = mlflow.active_run()
+            if run_info:
+                # Use our custom MLflow models directory
+                run_id = run_info.info.run_id
+                model_output_path = mlflow_models_dir / run_id
+                model_output_path.mkdir(exist_ok=True)
+                
+                # Save a copy of the model to our custom directory
+                final_model_path = model_output_path / "model.pth"
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'class_to_idx': class_to_idx,
+                    'config': self.config.dict()
+                }, final_model_path)
+                
+                # Log the local path as an artifact
+                mlflow.log_artifact(str(final_model_path))
+                
+                # Use the directory as the return path
+                final_model_path = model_output_path
+            else:
+                # Fallback to local storage only if MLflow run isn't active
+                final_model_path = model_dir / "final_model.pth"
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'class_to_idx': class_to_idx,
+                    'config': self.config.dict()
+                }, final_model_path)
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'class_to_idx': class_to_idx,
+                    'config': self.config.dict()
+                }, final_model_path)
             
             # End MLflow run
             end_run()
             
-            await self._update_job_log(job_id, f"Training completed successfully. Model saved to {model_path}")
-            # Return a dictionary with status and model path
+            # Get MLflow run information for model reference
+            run_info = mlflow.active_run()
+            mlflow_run_id = run_info.info.run_id if run_info else None
+            mlflow_model_uri = f"runs:/{mlflow_run_id}/model" if mlflow_run_id else None
+            
             return {
                 "status": "completed",
-                "model_path": model_path,
-                "metrics": {
-                    "final_train_loss": train_loss,
-                    "final_train_accuracy": train_acc,
-                    "final_val_loss": val_loss if val_loader else None,
-                    "final_val_accuracy": val_acc if val_loader else None,
-                    **({} if not val_loader else metrics_dict)  # Include additional metrics if we have validation data
-                }
+                "model_path": str(final_model_path),
+                "mlflow_model_uri": mlflow_model_uri,
+                "mlflow_run_id": mlflow_run_id,
+                "training_time": time_elapsed,
+                "epochs_completed": epoch + 1,
+                "final_train_loss": train_loss,
+                "final_train_accuracy": train_acc / 100.0,
+                "final_val_loss": val_loss if val_loader else None,
+                "final_val_accuracy": val_acc / 100.0 if val_loader else None,
+                "class_mapping": class_to_idx
             }
-            
+                
         except Exception as e:
-            # End MLflow run in case of error
-            from mlflow_utils import end_run
-            end_run()
             await self._update_job_log(job_id, f"Error during training: {str(e)}")
-            # Return error status
+            
+            # End MLflow run on error
+            try:
+                from mlflow_utils import end_run
+                end_run()
+            except:
+                pass
+                
             return {
                 "status": "failed",
                 "error": str(e)
@@ -278,22 +432,35 @@ class ImageClassificationPipeline(BasePipeline):
         """Get data transforms based on configuration"""
         from torchvision import transforms
         
-        base_transform = [
-            transforms.Resize(self.config.image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])
-        ]
+        # Set image size from config
+        resize_dim = self.config.image_size
+        
+        # ImageNet normalization values
+        normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )
         
         if self.config.augmentation_enabled:
-            augment_transform = [
-                transforms.RandomHorizontalFlip(0.5),
-                transforms.RandomRotation(10),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2)
-            ] + base_transform
-            return transforms.Compose(augment_transform)
+            # Training transforms with data augmentation
+            transform = transforms.Compose([
+                transforms.RandomResizedCrop(resize_dim),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(20),
+                transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
+                transforms.ToTensor(),
+                normalize,
+            ])
+        else:
+            # Validation and testing transforms (no augmentation)
+            transform = transforms.Compose([
+                transforms.Resize(int(resize_dim * 1.14)),  # Slightly larger for center crop
+                transforms.CenterCrop(resize_dim),
+                transforms.ToTensor(),
+                normalize,
+            ])
         
-        return transforms.Compose(base_transform)
+        return transform
         
     async def predict(self, image, model=None) -> Dict[str, Any]:
         """Make a prediction using the trained model"""
@@ -308,28 +475,166 @@ class ImageClassificationPipeline(BasePipeline):
         with torch.no_grad():
             model.eval()
             outputs = model(image_tensor)
-            probabilities = torch.softmax(outputs, dim=1)[0]
+            probabilities = torch.softmax(outputs, dim=1)
             
             # Get top-k predictions
-            num_classes = len(probabilities)
-            k = min(5, num_classes)
-            top_p, top_class = torch.topk(probabilities, k)
+            topk = min(5, outputs.size(1))  # Get top-5 or fewer if less than 5 classes
+            confidence, predicted = torch.topk(probabilities, topk)
             
+            # Convert to lists
+            confidence = confidence.squeeze().tolist()
+            predicted = predicted.squeeze().tolist()
+            
+            # Ensure we handle scalars properly
+            if isinstance(confidence, float):
+                confidence = [confidence]
+                predicted = [predicted]
+                
+            # Return predictions with confidence
+            predictions = []
+            for i, (pred, conf) in enumerate(zip(predicted, confidence)):
+                predictions.append({
+                    "rank": i + 1,
+                    "class_id": int(pred),
+                    "confidence": float(conf)
+                })
+                
             return {
-                "probabilities": probabilities.cpu().tolist(),
-                "predicted_classes": top_class.cpu().tolist(),
-                "confidence_scores": top_p.cpu().tolist()
+                "predictions": predictions,
+                "raw_output": outputs.cpu().numpy().tolist()
             }
     
-    async def evaluate(self, dataset_path: str) -> Dict[str, Any]:
-        """Evaluate the model on a test dataset"""
-        # Implementation for evaluation on test dataset
-        pass
+    async def evaluate(self, dataset_path: str, model_path: str = None, job_id: str = None) -> Dict[str, Any]:
+        """
+        Evaluate the model on a test dataset
+        
+        Args:
+            dataset_path: Path to test dataset
+            model_path: Path to saved model (if None, will use self.model)
+            job_id: Optional job ID for logging
+            
+        Returns:
+            Dictionary with evaluation metrics
+        """
+        try:
+            # Load model if path is provided
+            if model_path:
+                checkpoint = torch.load(model_path)
+                model = self.create_model()
+                model.load_state_dict(checkpoint['model_state_dict'])
+                class_to_idx = checkpoint.get('class_to_idx', {})
+                idx_to_class = {v: k for k, v in class_to_idx.items()} if class_to_idx else None
+            else:
+                # Ensure we have a model to evaluate
+                raise ValueError("Model path must be provided for evaluation")
+                
+            # Set model to evaluation mode
+            model.eval()
+            
+            # Get transforms and create test dataloader
+            transform = self.get_transforms()
+            test_loader, _, classes = create_dataloaders(
+                dataset_path, transform, 
+                batch_size=self.config.batch_size,
+                val_split=0.0,  # Use all data for testing
+                shuffle=False   # No need to shuffle for evaluation
+            )
+            
+            # If we have a mapping from the training phase, use it for consistency
+            if idx_to_class is not None:
+                classes = [idx_to_class[i] for i in range(len(idx_to_class))]
+            
+            # Track metrics
+            all_targets = []
+            all_preds = []
+            all_scores = []
+            
+            # Evaluate the model
+            with torch.no_grad():
+                for data, targets in test_loader:
+                    data, targets = data.to(self.device), targets.to(self.device)
+                    
+                    # Forward pass
+                    outputs = model(data)
+                    probabilities = torch.softmax(outputs, dim=1)
+                    _, predicted = torch.max(outputs, 1)
+                    
+                    # Store for metrics
+                    all_preds.append(predicted.cpu())
+                    all_targets.append(targets.cpu())
+                    all_scores.append(probabilities.cpu())
+                    
+                    if job_id:
+                        # Log progress occasionally
+                        if len(all_preds) % 10 == 0:
+                            await self._update_job_log(job_id, f"Evaluated {len(all_preds)} batches")
+            
+            # Concatenate all tensors
+            all_preds = torch.cat(all_preds).numpy()
+            all_targets = torch.cat(all_targets).numpy()
+            all_scores = torch.cat(all_scores).numpy()
+            
+            # Calculate metrics
+            metrics_dict = calculate_classification_metrics(all_targets, all_preds, all_scores)
+            
+            # Log the evaluation metrics
+            if job_id:
+                await self._update_job_log(job_id, f"Evaluation complete. Accuracy: {metrics_dict.get('accuracy', 0):.4f}")
+                
+                # If MLflow is being used
+                try:
+                    from mlflow_utils import start_run, log_metrics, end_run
+                    run_id = start_run(f"{job_id}_eval", self.config.dict())
+                    
+                    log_metrics(metrics_dict)
+                    
+                    # Create confusion matrix visualization
+                    from visualization_utils import create_confusion_matrix
+                    cm_path = create_confusion_matrix(
+                        all_targets, 
+                        all_preds,
+                        class_names=classes,
+                        title="Confusion Matrix"
+                    )
+                    mlflow.log_artifact(cm_path, "visualizations")
+                    
+                    end_run()
+                except ImportError:
+                    # MLflow utils not available
+                    pass
+            
+            # Generate and return the full evaluation results
+            confusion = get_confusion_matrix(all_targets, all_preds)
+            report = generate_classification_report(all_targets, all_preds, target_names=classes)
+            
+            return {
+                "status": "completed",
+                "metrics": metrics_dict,
+                "confusion_matrix": confusion.tolist(),
+                "classification_report": report,
+                "class_names": classes
+            }
+            
+        except Exception as e:
+            if job_id:
+                await self._update_job_log(job_id, f"Error during evaluation: {str(e)}")
+            return {
+                "status": "failed",
+                "error": str(e)
+            }
     
     @staticmethod
     def get_metrics() -> List[str]:
         """Get the list of metrics supported by this pipeline"""
-        return ["accuracy", "precision", "recall", "f1_score"]
+        return [
+            'accuracy', 
+            'precision_macro', 
+            'recall_macro', 
+            'f1_macro',
+            'precision_weighted', 
+            'recall_weighted', 
+            'f1_weighted'
+        ]
         
     async def _update_job_log(self, job_id: str, message: str):
         """Update the job log with a message"""

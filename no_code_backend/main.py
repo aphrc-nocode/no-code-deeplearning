@@ -98,6 +98,7 @@ class PipelineConfig(BaseModel):
     image_size: tuple = (224, 224)
     augmentation_enabled: bool = True
     early_stopping: bool = True
+    feature_extraction_only: bool = False
     patience: int = 5
     segmentation_type: Optional[SegmentationType] = SegmentationType.SEMANTIC
     dataset_source: Optional[DatasetSource] = DatasetSource.LOCAL

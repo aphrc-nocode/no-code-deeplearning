@@ -21,13 +21,14 @@ async def run_image_classification_example(dataset_path: str):
         task_type=TaskType.IMAGE_CLASSIFICATION,
         architecture=ModelArchitecture.RESNET18,
         num_classes=2,
-        batch_size=8,
+        batch_size=2,
         epochs=10,  # Use small number of epochs for example
         learning_rate=0.001,
         image_size=(224, 224),
         augmentation_enabled=True,
         early_stopping=True,
-        patience=2
+        patience=2,
+        feature_extraction_only=False  # Use fine-tuning approach
     )
     
     # Create pipeline
@@ -39,11 +40,28 @@ async def run_image_classification_example(dataset_path: str):
     
     print(f"Training result: {result['status']}")
     if result['status'] == 'completed':
-        print(f"Model saved to: {result['model_path']}")
-        print("Metrics:")
-        for name, value in result['metrics'].items():
+        if result.get('mlflow_run_id'):
+            print(f"Model saved to MLflow - Run ID: {result['mlflow_run_id']}")
+            print(f"MLflow Model URI: {result['mlflow_model_uri']}")
+        else:
+            print(f"Model saved to: {result['model_path']}")
+            
+        print("Training Metrics:")
+        # Print the metrics that are available in the result
+        metrics = [
+            ('Training Loss', result.get('final_train_loss')),
+            ('Training Accuracy', result.get('final_train_accuracy')),
+            ('Validation Loss', result.get('final_val_loss')),
+            ('Validation Accuracy', result.get('final_val_accuracy')),
+            ('Epochs Completed', result.get('epochs_completed')),
+            ('Training Time (s)', result.get('training_time'))
+        ]
+        for name, value in metrics:
             if value is not None:
-                print(f"  {name}: {value:.4f}")
+                if isinstance(value, float):
+                    print(f"  {name}: {value:.4f}")
+                else:
+                    print(f"  {name}: {value}")
 
 async def run_object_detection_example(dataset_path: str):
     """Run object detection pipeline example"""
@@ -74,10 +92,22 @@ async def run_object_detection_example(dataset_path: str):
     print(f"Training result: {result['status']}")
     if result['status'] == 'completed':
         print(f"Model saved to: {result['model_path']}")
-        print("Metrics:")
-        for name, value in result['metrics'].items():
+        print("Training Metrics:")
+        # Print the metrics that are available in the result
+        metrics = [
+            ('Training Loss', result.get('final_train_loss')),
+            ('Training Accuracy', result.get('final_train_accuracy')),
+            ('Validation Loss', result.get('final_val_loss')),
+            ('Validation Accuracy', result.get('final_val_accuracy')),
+            ('Epochs Completed', result.get('epochs_completed')),
+            ('Training Time (s)', result.get('training_time'))
+        ]
+        for name, value in metrics:
             if value is not None:
-                print(f"  {name}: {value:.4f}")
+                if isinstance(value, float):
+                    print(f"  {name}: {value:.4f}")
+                else:
+                    print(f"  {name}: {value}")
 
 async def run_semantic_segmentation_example(dataset_path: str):
     """Run semantic segmentation pipeline example"""
@@ -109,10 +139,22 @@ async def run_semantic_segmentation_example(dataset_path: str):
     print(f"Training result: {result['status']}")
     if result['status'] == 'completed':
         print(f"Model saved to: {result['model_path']}")
-        print("Metrics:")
-        for name, value in result['metrics'].items():
+        print("Training Metrics:")
+        # Print the metrics that are available in the result
+        metrics = [
+            ('Training Loss', result.get('final_train_loss')),
+            ('Training Accuracy', result.get('final_train_accuracy')),
+            ('Validation Loss', result.get('final_val_loss')),
+            ('Validation Accuracy', result.get('final_val_accuracy')),
+            ('Epochs Completed', result.get('epochs_completed')),
+            ('Training Time (s)', result.get('training_time'))
+        ]
+        for name, value in metrics:
             if value is not None:
-                print(f"  {name}: {value:.4f}")
+                if isinstance(value, float):
+                    print(f"  {name}: {value:.4f}")
+                else:
+                    print(f"  {name}: {value}")
 
 async def run_instance_segmentation_example(dataset_path: str):
     """Run instance segmentation pipeline example"""
@@ -144,10 +186,22 @@ async def run_instance_segmentation_example(dataset_path: str):
     print(f"Training result: {result['status']}")
     if result['status'] == 'completed':
         print(f"Model saved to: {result['model_path']}")
-        print("Metrics:")
-        for name, value in result['metrics'].items():
+        print("Training Metrics:")
+        # Print the metrics that are available in the result
+        metrics = [
+            ('Training Loss', result.get('final_train_loss')),
+            ('Training Accuracy', result.get('final_train_accuracy')),
+            ('Validation Loss', result.get('final_val_loss')),
+            ('Validation Accuracy', result.get('final_val_accuracy')),
+            ('Epochs Completed', result.get('epochs_completed')),
+            ('Training Time (s)', result.get('training_time'))
+        ]
+        for name, value in metrics:
             if value is not None:
-                print(f"  {name}: {value:.4f}")
+                if isinstance(value, float):
+                    print(f"  {name}: {value:.4f}")
+                else:
+                    print(f"  {name}: {value}")
 
 async def main():
     """Run examples for all pipelines"""
@@ -156,7 +210,7 @@ async def main():
     
     # Use the same test dataset for all examples
     # In a real scenario, you would use appropriate datasets for each task
-    test_dataset_path = "/home/alvin/demo"
+    test_dataset_path = "test_data"
     
     # Ensure test dataset exists
     if not os.path.exists(test_dataset_path):
