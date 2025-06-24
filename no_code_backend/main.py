@@ -112,7 +112,7 @@ class TrainingJob(BaseModel):
     completed_at: Optional[datetime] = None
     metrics: Dict[str, float] = {}
     model_path: Optional[str] = None
-    logs: List[str] = []
+    logs: List[str] = []    
 
 
 # ==================== Pipeline Factory ====================

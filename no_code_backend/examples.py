@@ -4,6 +4,8 @@ This script demonstrates how to use the various pipelines for image classificati
 """
 import asyncio
 import os
+import torch
+import mlflow
 from pathlib import Path
 from main import (
     TaskType, ModelArchitecture, PipelineConfig, SegmentationType, 
@@ -62,6 +64,72 @@ async def run_image_classification_example(dataset_path: str):
                     print(f"  {name}: {value:.4f}")
                 else:
                     print(f"  {name}: {value}")
+        
+        # Evaluate model on test data
+        print("\nEvaluating classification model...")
+        print("Looking for test directory, then validation directory, or creating a validation split.")
+        if result.get('mlflow_model_uri'):
+            print(f"Loading model from MLflow URI: {result['mlflow_model_uri']}")
+            import mlflow
+            model = mlflow.pytorch.load_model(result['mlflow_model_uri'])
+        else:
+            print(f"Loading model from local path: {result['model_path']}")
+            import torch
+            from pathlib import Path
+            
+            model_path = Path(result['model_path'])
+            # Check if path is a directory (MLflow format) or a file
+            if model_path.is_dir():
+                # Look for model.pth inside the directory
+                model_file = model_path / "model.pth"
+                if not model_file.exists():
+                    # Try to find any .pth file
+                    pth_files = list(model_path.glob("*.pth"))
+                    if pth_files:
+                        model_file = pth_files[0]
+                    else:
+                        # Try to use MLflow to load the model
+                        print(f"No model file found in {model_path}, trying MLflow")
+                        import mlflow
+                        run_id = model_path.name  # Use directory name as run ID
+                        try:
+                            model = mlflow.pytorch.load_model(f"runs:/{run_id}/model")
+                            # If we successfully load the model, skip the rest of this block
+                            print(f"Successfully loaded model from MLflow run ID: {run_id}")
+                            checkpoint = None
+                        except Exception as e:
+                            raise FileNotFoundError(f"No model file found in {model_path} and MLflow loading failed: {e}")
+                if 'checkpoint' not in locals() or checkpoint is not None:
+                    print(f"Found model file: {model_file}")
+                    checkpoint = torch.load(str(model_file), weights_only=False)
+            else:
+                # Direct file path
+                checkpoint = torch.load(str(model_path), weights_only=False)
+            
+            # Recreate model and load weights if we have a checkpoint
+            if 'checkpoint' in locals() and checkpoint is not None:
+                from models.classification import model_factory
+                model = model_factory.create_model(
+                    config.architecture,
+                    num_classes=config.num_classes
+                )
+                model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Evaluate the model
+        from evaluate_model import evaluate_classification_model
+        evaluation_result = evaluate_classification_model(
+            model, 
+            dataset_path, 
+            batch_size=config.batch_size, 
+            job_id="example_classification"  # Pass the same job_id to use saved splits
+        )
+        
+        print("Evaluation Metrics:")
+        for name, value in evaluation_result.items():
+            if isinstance(value, float):
+                print(f"  {name}: {value:.4f}")
+            else:
+                print(f"  {name}: {value}")
 
 async def run_object_detection_example(dataset_path: str):
     """Run object detection pipeline example"""
@@ -72,11 +140,11 @@ async def run_object_detection_example(dataset_path: str):
         name="Object Detection Example",
         task_type=TaskType.OBJECT_DETECTION,
         architecture=ModelArchitecture.FASTER_RCNN,
-        num_classes=2,  # Background + 1 object class
+        num_classes=2,  #
         batch_size=2,  # Smaller batch size for detection
         epochs=2,  # Use small number of epochs for example
         learning_rate=0.005,
-        image_size=(800, 800),  # Larger image size for detection
+        image_size=(640, 640),  # Larger image size for detection
         augmentation_enabled=True,
         early_stopping=True,
         patience=2
@@ -91,23 +159,90 @@ async def run_object_detection_example(dataset_path: str):
     
     print(f"Training result: {result['status']}")
     if result['status'] == 'completed':
-        print(f"Model saved to: {result['model_path']}")
+        if result.get('mlflow_run_id'):
+            print(f"Model saved to MLflow - Run ID: {result['mlflow_run_id']}")
+            print(f"MLflow Model URI: {result['mlflow_model_uri']}")
+        else:
+            print(f"Model saved to: {result['model_path']}")
+            
         print("Training Metrics:")
         # Print the metrics that are available in the result
-        metrics = [
-            ('Training Loss', result.get('final_train_loss')),
-            ('Training Accuracy', result.get('final_train_accuracy')),
-            ('Validation Loss', result.get('final_val_loss')),
-            ('Validation Accuracy', result.get('final_val_accuracy')),
+        metrics = result.get('metrics', {})
+        metrics_to_display = [
+            ('Training Loss', metrics.get('final_train_loss')),
+            ('Training mAP', metrics.get('final_train_mAP')),
+            ('Validation Loss', metrics.get('final_val_loss')),
+            ('Validation mAP', metrics.get('final_val_mAP')),
             ('Epochs Completed', result.get('epochs_completed')),
             ('Training Time (s)', result.get('training_time'))
         ]
-        for name, value in metrics:
+        for name, value in metrics_to_display:
             if value is not None:
                 if isinstance(value, float):
                     print(f"  {name}: {value:.4f}")
                 else:
                     print(f"  {name}: {value}")
+        
+        # Evaluate model on test data
+        print("\nEvaluating detection model on the same dataset...")
+        if result.get('mlflow_model_uri'):
+            print(f"Loading model from MLflow URI: {result['mlflow_model_uri']}")
+            import mlflow
+            model = mlflow.pytorch.load_model(result['mlflow_model_uri'])
+        else:
+            print(f"Loading model from local path: {result['model_path']}")
+            import torch
+            from pathlib import Path
+            
+            model_path = Path(result['model_path'])
+            # Check if path is a directory (MLflow format) or a file
+            if model_path.is_dir():
+                # Look for model.pth inside the directory
+                model_file = model_path / "model.pth"
+                if not model_file.exists():
+                    # Try to find any .pth file
+                    pth_files = list(model_path.glob("*.pth"))
+                    if pth_files:
+                        model_file = pth_files[0]
+                    else:
+                        # Try to use MLflow to load the model
+                        print(f"No model file found in {model_path}, trying MLflow")
+                        import mlflow
+                        run_id = model_path.name  # Use directory name as run ID
+                        try:
+                            model = mlflow.pytorch.load_model(f"runs:/{run_id}/model")
+                            # If we successfully load the model, skip the rest of this block
+                            print(f"Successfully loaded model from MLflow run ID: {run_id}")
+                            checkpoint = None
+                        except Exception as e:
+                            raise FileNotFoundError(f"No model file found in {model_path} and MLflow loading failed: {e}")
+                if 'checkpoint' not in locals() or checkpoint is not None:
+                    print(f"Found model file: {model_file}")
+                    checkpoint = torch.load(str(model_file), weights_only=False)
+            else:
+                # Direct file path
+                checkpoint = torch.load(str(model_path), weights_only=False)
+            
+            # Recreate model and load weights if we have a checkpoint
+            if 'checkpoint' in locals() and checkpoint is not None:
+                from models.detection import model_factory
+                model = model_factory.create_model(
+                    config.architecture,
+                    num_classes=config.num_classes,
+                    pretrained=False
+                )
+                model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Evaluate the model
+        from evaluate_model import evaluate_detection_model
+        evaluation_result = evaluate_detection_model(model, dataset_path, batch_size=config.batch_size)
+        
+        print("Evaluation Metrics:")
+        for name, value in evaluation_result.items():
+            if isinstance(value, float):
+                print(f"  {name}: {value:.4f}")
+            else:
+                print(f"  {name}: {value}")
 
 async def run_semantic_segmentation_example(dataset_path: str):
     """Run semantic segmentation pipeline example"""
@@ -221,7 +356,7 @@ async def main():
     # Run examples
     await run_image_classification_example(test_dataset_path)
     # Uncomment to run other examples once you have appropriate datasets
-    # await run_object_detection_example("datasets/detection_data")
+    # await run_object_detection_example("/home/achuka/object-detect")
     # await run_semantic_segmentation_example("datasets/segmentation_data")
     # await run_instance_segmentation_example("datasets/instance_seg_data")
     

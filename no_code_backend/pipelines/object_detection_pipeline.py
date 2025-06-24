@@ -14,6 +14,7 @@ from pipelines.base_pipeline import BasePipeline
 from models.detection import model_factory
 from datasets_module.detection.dataloaders import create_dataloaders
 from metrics.detection.metrics import calculate_detection_metrics
+from mlflow_utils import log_model, start_run, log_metrics, log_batch_metrics, end_run
 
 class ObjectDetectionPipeline(BasePipeline):
     """Pipeline for object detection tasks"""
@@ -220,33 +221,71 @@ class ObjectDetectionPipeline(BasePipeline):
             if best_model_state:
                 model.load_state_dict(best_model_state)
             
-            # Save the model
-            os.makedirs("models", exist_ok=True)
-            model_path = f"models/{job_id}.pth"
+            # Create the target directory for MLflow models
+            mlflow_models_dir = Path("logs/mlflow/models")
+            mlflow_models_dir.mkdir(parents=True, exist_ok=True)
             
-            # Save necessary components
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'config': {k: v for k, v in self.config.dict().items()},
-                'class_to_idx': class_to_idx
-            }, model_path)
+            # Save class mapping separately for easier loading
+            class_mapping_path = mlflow_models_dir / f"{job_id}_class_mapping.json"
+            import json
+            with open(class_mapping_path, 'w') as f:
+                json.dump(class_to_idx, f)
             
-            # Log final model to MLflow
+            # Log model to MLflow
             log_model(
                 model=model,
-                model_path=model_path,
+                model_path="model",
                 class_to_idx=class_to_idx,
                 config=self.config.dict()
             )
             
+            # Get MLflow run info to use as model path
+            run_info = mlflow.active_run()
+            local_model_path = None
+            
+            if run_info:
+                # Use our custom MLflow models directory
+                run_id = run_info.info.run_id
+                model_output_path = mlflow_models_dir / run_id
+                model_output_path.mkdir(exist_ok=True)
+                
+                # Save a copy of the model to our custom directory
+                final_model_path = model_output_path / "model.pth"
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'class_to_idx': class_to_idx,
+                    'config': self.config.dict()
+                }, final_model_path)
+                
+                # Log the local path as an artifact
+                mlflow.log_artifact(str(final_model_path))
+                
+                # Use the directory as the return path
+                local_model_path = str(model_output_path)
+            else:
+                # Fallback to local storage if MLflow run isn't active
+                os.makedirs("models", exist_ok=True)
+                local_model_path = f"models/{job_id}.pth"
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'class_to_idx': class_to_idx,
+                    'config': self.config.dict()
+                }, local_model_path)
+            
             # End MLflow run
+            mlflow_run_id = self.run_id
             end_run()
             
-            await self._update_job_log(job_id, f"Training completed successfully. Model saved to {model_path}")
+            # Get MLflow model URI for the saved model
+            mlflow_model_uri = f"runs:/{mlflow_run_id}/model" if mlflow_run_id else None
+            
+            await self._update_job_log(job_id, f"Training completed successfully. Model saved to {local_model_path}")
             # Return a dictionary with status and model path
             return {
                 "status": "completed",
-                "model_path": model_path,
+                "model_path": local_model_path,
+                "mlflow_model_uri": mlflow_model_uri,
+                "mlflow_run_id": mlflow_run_id,
                 "metrics": {
                     "final_train_loss": train_loss,
                     "final_train_mAP": train_map,

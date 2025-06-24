@@ -62,12 +62,15 @@ class ImageClassificationPipeline(BasePipeline):
                 "initial_learning_rate": self.config.learning_rate
             })
             
-            # Create datasets and data loaders
+            # Create datasets and data loaders with persistent splits
             transform = self.get_transforms()
-            train_loader, val_loader, classes = create_dataloaders(
+            train_loader, val_loader, test_loader, classes = create_dataloaders(
                 dataset_path, transform, 
                 batch_size=self.config.batch_size,
-                val_split=0.2 if self.config.early_stopping else 0.0
+                val_split=0.2 if self.config.early_stopping else 0.1,
+                test_split=0.1,
+                job_id=job_id,  # Pass job_id to ensure splits persistence
+                use_saved_splits=False  # Create new splits for this training run
             )
             
             # Store class mapping
@@ -78,6 +81,8 @@ class ImageClassificationPipeline(BasePipeline):
             await self._update_job_log(job_id, f"Training on {len(train_loader.dataset)} samples")
             if val_loader:
                 await self._update_job_log(job_id, f"Validating on {len(val_loader.dataset)} samples")
+            if test_loader:
+                await self._update_job_log(job_id, f"Test set has {len(test_loader.dataset)} samples (reserved for evaluation)")
             
             # Initialize tracking variables
             best_loss = float('inf')
@@ -531,14 +536,59 @@ class ImageClassificationPipeline(BasePipeline):
             # Set model to evaluation mode
             model.eval()
             
-            # Get transforms and create test dataloader
+            # Get transforms for evaluation
             transform = self.get_transforms()
-            test_loader, _, classes = create_dataloaders(
-                dataset_path, transform, 
-                batch_size=self.config.batch_size,
-                val_split=0.0,  # Use all data for testing
-                shuffle=False   # No need to shuffle for evaluation
-            )
+            
+            # Check if we have a test directory
+            test_dir = Path(dataset_path) / "test"
+            if test_dir.exists():
+                # Use the test directory exclusively
+                print(f"Using dedicated test directory: {test_dir}")
+                test_loader, _, _, classes = create_dataloaders(
+                    str(test_dir), transform, 
+                    batch_size=self.config.batch_size,
+                    val_split=0.0,  # Use all data for testing
+                    test_split=0.0,  # No additional split needed
+                    shuffle=False    # No need to shuffle for evaluation
+                )
+            else:
+                # No test directory, try to load saved splits
+                try:
+                    print(f"Looking for saved splits from training job: {job_id}")
+                    # Create a loader using the saved test split
+                    _, _, test_loader, classes = create_dataloaders(
+                        dataset_path, transform,
+                        batch_size=self.config.batch_size,
+                        job_id=job_id,             # Use job_id to find splits
+                        use_saved_splits=True,     # Use the persistent splits
+                        shuffle=False
+                    )
+                    print(f"Using saved test split with {len(test_loader.dataset)} samples")
+                except Exception as e:
+                    print(f"Could not load saved splits: {e}")
+                    print("Falling back to validation split approach")
+                    # Fallback to previous behavior - check for val directory
+                    val_dir = Path(dataset_path) / "val"
+                    if val_dir.exists():
+                        print(f"Using validation directory: {val_dir}")
+                        train_loader, test_loader, _, classes = create_dataloaders(
+                            str(val_dir), transform,
+                            batch_size=self.config.batch_size,
+                            val_split=0.0,
+                            test_split=0.0,
+                            shuffle=False
+                        )
+                    else:
+                        # If no test or val directory, and no saved splits,
+                        # create a new 80/10/10 split and use the test split
+                        print(f"No dedicated test/val directory or saved splits. Creating a temporary test split.")
+                        train_loader, val_loader, test_loader, classes = create_dataloaders(
+                            dataset_path, transform,
+                            batch_size=self.config.batch_size,
+                            val_split=0.1,
+                            test_split=0.1,
+                            shuffle=False
+                        )
             
             # If we have a mapping from the training phase, use it for consistency
             if idx_to_class is not None:

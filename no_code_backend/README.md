@@ -7,6 +7,7 @@ This project is a modular backend for computer vision tasks, supporting image cl
 - **Image Classification**: Train models to classify images into predefined categories
   - Metrics: Accuracy, Precision, Recall, F1 Score
   - Supported architectures: ResNet18/50, VGG16, EfficientNet, MobileNet
+  - Persistent train/val/test splits for consistent evaluation
 
 - **Object Detection**: Train models to detect and localize objects with bounding boxes
   - Metrics: Average Precision (AP), Mean Average Precision (mAP), AP at different IoU thresholds
@@ -36,11 +37,38 @@ no_code_backend/
 │   ├── classification/
 │   ├── detection/
 │   └── segmentation/
-└── datasets/                    # Dataset handling for each task
-    ├── classification/
-    ├── detection/
-    └── segmentation/
+├── datasets_module/             # Dataset handling for each task
+│   ├── classification/
+│   ├── detection/
+│   └── segmentation/
+├── models/                      # Saved models
+│   └── [job_id]/                # Job-specific model data
+│       └── model.pth            # Saved model weights
+└── dataset_splits/             # Persistent dataset splits (gitignored)
+    └── [job_id]/               # Job-specific splits
+        └── dataset_splits.json # Train/val/test splits for reproducibility
 ```
+
+## Dataset Split Persistence
+
+For image classification tasks, the system now generates and saves train/validation/test splits during training, ensuring that:
+
+1. The same test data is used consistently during model evaluation
+2. No leakage occurs between training and test data
+3. Evaluation metrics are reliable and reproducible
+
+Split information is stored in JSON format with the following structure:
+```json
+{
+  "train": [0, 3, 7, ...],  // Indices for training set
+  "val": [1, 4, 9, ...],    // Indices for validation set
+  "test": [2, 5, 8, ...],   // Indices for testing set
+  "random_seed": 42,        // Random seed used for reproducibility
+  "dataset_path": "/path/to/dataset"  // Original dataset path
+}
+```
+
+These splits are automatically loaded during evaluation when the same job_id is provided, ensuring that the model is always evaluated on the same test data that was held out during training.
 
 ## Getting Started
 

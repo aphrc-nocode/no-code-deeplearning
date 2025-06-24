@@ -9,6 +9,7 @@ datasets/
 logs/
 test_data/
 temp/
+dataset_splits/
 
 # Virtual environments
 venv/
