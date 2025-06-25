@@ -84,11 +84,11 @@ def main(args):
         print("\n--- Pushing Best Model to Hugging Face Hub ---")
         trainer.push_to_hub()
 
-    print("\n--- Evaluating on Test Set ---")
-    test_metrics = trainer.evaluate(eval_dataset=test_dataset, metric_key_prefix="test")
-    pprint(test_metrics)
+#    print("\n--- Evaluating on Test Set ---")
+#    test_metrics = trainer.evaluate(eval_dataset=test_dataset, metric_key_prefix="test")
+#    pprint(test_metrics)
 
-    print("\n--- Training and Evaluation Complete ---")
+#    print("\n--- Training and Evaluation Complete ---")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train an object detection model.")
