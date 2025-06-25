@@ -2,15 +2,19 @@
 Dataloaders for object detection tasks.
 """
 import torch
-from torch.utils.data import Dataset, DataLoader
-import torchvision
+from torch.utils.data import Dataset, DataLoader, Subset
+from torchvision import transforms
 from PIL import Image
 import os
+import time
 from pathlib import Path
 import json
 from typing import Dict, List, Tuple, Optional, Any
 import numpy as np
 import glob
+import importlib
+import random
+
 
 class ObjectDetectionDataset(Dataset):
     """Dataset for object detection tasks"""
@@ -143,6 +147,152 @@ class ObjectDetectionDataset(Dataset):
             image, target = self.transform(image, target)
         
         return image, target
+    
+    def create_and_save_splits(self, val_split: float = 0.2, test_split: float = 0.1, job_id: str = None):
+        """
+        Create train/val/test splits and save them to a file for reproducibility
+        
+        Args:
+            val_split: Proportion of data to use for validation
+            test_split: Proportion of data to use for testing
+            job_id: Unique job ID to identify the splits
+            
+        Returns:
+            Dictionary with train/val/test indices
+        """
+        if job_id is None:
+            # If no job ID, create random splits but don't persist them
+            return self._create_splits(val_split, test_split)
+        
+        # Create dataset_splits directory if it doesn't exist
+        splits_dir = Path("dataset_splits")
+        splits_dir.mkdir(exist_ok=True)
+        
+        # Create job-specific directory
+        job_splits_dir = splits_dir / job_id
+        job_splits_dir.mkdir(exist_ok=True)
+        
+        # Define path for splits file
+        splits_file = job_splits_dir / "dataset_splits.json"
+        
+        # Create and save splits
+        splits = self._create_splits(val_split, test_split)
+        
+        # Add extra metadata for verification when reloading
+        splits_data = {
+            "dataset_path": str(self.images_dir.absolute()),
+            "annotations_path": str(self.annotations_path.absolute()),
+            "train": splits["train"],
+            "val": splits["val"],
+            "test": splits["test"],
+            "created_at": time.time()  # Add timestamp for reference
+        }
+        
+        # Save to file
+        with open(splits_file, 'w') as f:
+            json.dump(splits_data, f)
+            
+        print(f"Dataset splits saved to {splits_file}")
+        
+        return splits
+        
+    def _create_splits(self, val_split: float = 0.2, test_split: float = 0.1):
+        """
+        Create train/val/test splits without persisting them
+        
+        Args:
+            val_split: Proportion of data to use for validation
+            test_split: Proportion of data to use for testing
+            
+        Returns:
+            Dictionary with train/val/test indices
+        """
+        # Get total number of samples
+        n_samples = len(self)
+        
+        # Calculate number of validation and test samples
+        n_val = max(1, int(n_samples * val_split))
+        n_test = max(1, int(n_samples * test_split))
+        
+        # If the dataset is too small for both validation and test, prioritize validation
+        if n_val + n_test > n_samples - 1:
+            if n_samples <= 2:
+                # Extremely small dataset, use same samples for everything
+                n_val = 1 if n_samples > 1 else 0
+                n_test = 0
+            else:
+                # Give at least 1 sample for training
+                n_val = max(1, int(n_samples * 0.5))
+                n_test = max(0, min(n_samples - n_val - 1, int(n_samples * 0.25)))
+        
+        # Create list of indices and shuffle them
+        indices = list(range(n_samples))
+        random.shuffle(indices)
+        
+        # Split into train, validation, and test indices
+        test_indices = indices[:n_test]
+        val_indices = indices[n_test:n_test+n_val]
+        train_indices = indices[n_test+n_val:]
+        
+        print(f"Created splits: {len(train_indices)} train, {len(val_indices)} val, {len(test_indices)} test")
+        
+        return {
+            "train": train_indices,
+            "val": val_indices,
+            "test": test_indices
+        }
+    
+    @staticmethod
+    def load_splits(job_id: str):
+        """
+        Load saved splits for a given job ID
+        
+        Args:
+            job_id: Unique job ID to identify the splits
+            
+        Returns:
+            Dictionary with train/val/test indices
+            
+        Raises:
+            FileNotFoundError: If no splits file found for the job ID
+        """
+        # Define path for splits file
+        splits_file = Path("dataset_splits") / job_id / "dataset_splits.json"
+        
+        # Check if file exists
+        if not splits_file.exists():
+            raise FileNotFoundError(f"No splits file found at {splits_file}")
+        
+        # Load from file
+        with open(splits_file, 'r') as f:
+            splits_data = json.load(f)
+            
+        return splits_data
+    
+    @staticmethod
+    def cleanup_splits(job_id: str):
+        """
+        Clean up saved splits for a given job ID
+        
+        Args:
+            job_id: Unique job ID to identify the splits to clean up
+            
+        Returns:
+            True if splits were cleaned up, False otherwise
+        """
+        # Define path for job-specific splits directory
+        job_splits_dir = Path("dataset_splits") / job_id
+        
+        # Check if directory exists
+        if not job_splits_dir.exists():
+            print(f"No splits directory found at {job_splits_dir}, nothing to clean up")
+            return False
+        
+        # Remove the directory and its contents
+        import shutil
+        shutil.rmtree(job_splits_dir)
+        print(f"Cleaned up splits directory: {job_splits_dir}")
+        return True
 
 
 def find_annotation_file(directory, pattern="*.json"):
@@ -159,143 +309,213 @@ def find_annotation_file(directory, pattern="*.json"):
     return json_files[0]
 
 
-def create_dataloaders(dataset_path: str, transform=None, batch_size: int = 4, 
-                      val_split: float = 0.2, num_workers: int = 4, collate_fn=None):
+def collate_fn(batch):
     """
-    Create train and validation dataloaders for object detection
-    
-    This function supports both pre-split datasets and auto-splitting:
-    
-    1. Pre-split structure:
-       dataset_path/
-       ├── images/
-       │   ├── train/
-       │   ├── val/
-       │   └── test/
-       ├── annotations/
-       │   ├── instances_train.json
-       │   ├── instances_val.json
-       │   └── instances_test.json
-    
-    2. Alternative pre-split structure:
-       dataset_path/
-       ├── train/
-       │   ├── images/
-       │   ├── annotations.json
-       ├── val/
-       │   ├── images/
-       │   ├── annotations.json
-       
-    3. Auto-split from single dataset:
-       dataset_path/
-       ├── images/
-       ├── annotations.json
-    
-    Args:
-        dataset_path: Path to dataset directory
-        transform: Transforms to apply to images and targets
-        batch_size: Batch size
-        val_split: Validation split ratio (0 to 1)
-        num_workers: Number of workers for data loading
-        collate_fn: Custom collate function for batching
-        
-    Returns:
-        train_loader, val_loader, class_names
+    Custom collate function for object detection batches
     """
+    return tuple(zip(*batch))
+
+
+def create_dataloaders(dataset_path: str, transform, batch_size: int = 2, 
+                      val_split: float = 0.2, test_split: float = 0.1, 
+                      num_workers: int = 4, job_id: str = None,
+                      use_saved_splits: bool = False,
+                      shuffle: bool = True):
+    """Create training, validation and test dataloaders for object detection"""
+    # Add support for persistent splits when using auto-split approach
+    # For existing pre-split datasets, we'll use the existing splits
+
     dataset_path = Path(dataset_path)
+    print(f"Analyzing dataset structure at {dataset_path}...")
     
-    # Define a custom collate function if not provided
-    if collate_fn is None:
-        collate_fn = lambda batch: tuple(zip(*batch))
-    
-    # Check if this is a pre-split dataset
-    train_dir = dataset_path / "train"
-    val_dir = dataset_path / "val"
+    # Define common paths that might be found in the dataset structure
     images_dir = dataset_path / "images"
     annotations_dir = dataset_path / "annotations"
+    train_dir = dataset_path / "train"
+    val_dir = dataset_path / "val"
+    test_dir = dataset_path / "test"
     
-    # Case 1: Standard COCO split structure with images/train + annotations/instances_train.json
+    # Track if we found a pre-split dataset
+    pre_split_dataset_found = False
+    
+    # Case 1: Standard dataset with images and annotations directories
     if images_dir.exists() and annotations_dir.exists():
-        train_images_dir = images_dir / "train"
-        val_images_dir = images_dir / "val"
+        print(f"Found standard dataset structure with images and annotations directories")
         
+        # Look for pre-split annotations
         train_ann_path = annotations_dir / "instances_train.json"
         val_ann_path = annotations_dir / "instances_val.json"
+        test_ann_path = annotations_dir / "instances_test.json"
         
-        if not train_ann_path.exists():
-            # Try to find any annotation file for train
-            train_ann_path = find_annotation_file(annotations_dir, "*train*.json")
+        # Look for single annotation file
+        ann_files = list(annotations_dir.glob("*.json"))
         
-        if not val_ann_path.exists():
-            # Try to find any annotation file for val
-            val_ann_path = find_annotation_file(annotations_dir, "*val*.json")
-        
-        if train_images_dir.exists() and train_ann_path and train_ann_path.exists():
-            print(f"Using pre-split dataset: {train_images_dir} with {train_ann_path}")
-            train_dataset = ObjectDetectionDataset(train_images_dir, train_ann_path, transform)
+        if train_ann_path.exists():
+            print(f"Using standard pre-split dataset: {images_dir} with {train_ann_path}")
+            pre_split_dataset_found = True
             
-            if val_images_dir.exists() and val_ann_path and val_ann_path.exists():
-                val_dataset = ObjectDetectionDataset(val_images_dir, val_ann_path, transform)
-            else:
-                val_dataset = None
+            # Create train dataset
+            train_dataset = ObjectDetectionDataset(images_dir, train_ann_path, transform)
+            
+            # Create validation dataset if available
+            val_dataset = None
+            if val_ann_path.exists():
+                val_dataset = ObjectDetectionDataset(images_dir, val_ann_path, transform)
+            
+            # Create test dataset if available
+            test_dataset = None
+            if test_ann_path.exists():
+                test_dataset = ObjectDetectionDataset(images_dir, test_ann_path, transform)
                 
             class_names = train_dataset.get_class_names()
-                
-        else:
-            # Fall back to case 3
-            print("Standard COCO structure not found. Falling back to auto-split.")
-            return _create_dataloaders_auto_split(dataset_path, transform, batch_size, val_split, num_workers, collate_fn)
+            
+        elif len(ann_files) == 1:
+            # Single annotation file with images directory
+            ann_path = ann_files[0]
+            # Check if annotations file has explicit train/val/test splits defined internally
+            with open(ann_path, 'r') as f:
+                try:
+                    annotations = json.load(f)
+                    # Check if annotations have split information
+                    has_splits = False
+                    for img in annotations.get('images', [])[:10]:  # Check first few images
+                        if 'split' in img:
+                            has_splits = True
+                            break
+                    
+                    if has_splits:
+                        print(f"Found single annotation file with internal splits defined: {ann_path}")
+                        pre_split_dataset_found = True
+                        # Use the annotations file directly with ObjectDetectionDataset
+                        # but filter by split when creating the datasets
+                        # This would require extending the ObjectDetectionDataset class
+                        # For now, we'll fall back to auto-split
+                    
+                except Exception as e:
+                    print(f"Error reading annotation file {ann_path}: {e}")
     
-    # Case 2: Alternative structure with train/images + train/annotations.json
-    elif train_dir.exists():
+    # Case 2: Alternative dataset structure with train/val/test directories
+    if not pre_split_dataset_found and train_dir.exists():
+        print(f"Found alternative dataset structure with train directory: {train_dir}")
+        
+        # Check for images directory in train directory
         train_images_dir = train_dir / "images"
+        train_ann_path = None
+        
         if not train_images_dir.exists():
             # Check if images are directly in the train directory
             image_files = list(train_dir.glob("*.jpg")) + list(train_dir.glob("*.jpeg")) + list(train_dir.glob("*.png"))
             if image_files:
                 train_images_dir = train_dir
         
-        train_ann_path = find_annotation_file(train_dir)
-        if not train_ann_path:
-            train_ann_path = train_dir / "annotations.json"
+        # Look for annotations file in train directory
+        if train_images_dir.exists():
+            train_ann_path = find_annotation_file(train_dir)
+            if not train_ann_path:
+                train_ann_path = train_dir / "annotations.json"
+                if not train_ann_path.exists():
+                    print(f"No annotation file found in {train_dir}")
+                    train_ann_path = None
             
-        if train_images_dir.exists() and train_ann_path and train_ann_path.exists():
+        if train_ann_path and train_ann_path.exists():
             print(f"Using alternative pre-split dataset: {train_images_dir} with {train_ann_path}")
+            pre_split_dataset_found = True
+            
+            # Create train dataset
             train_dataset = ObjectDetectionDataset(train_images_dir, train_ann_path, transform)
             
             # Check for validation set
             val_dataset = None
             if val_dir.exists():
                 val_images_dir = val_dir / "images"
+                val_ann_path = None
+                
                 if not val_images_dir.exists():
                     # Check if images are directly in the val directory
                     image_files = list(val_dir.glob("*.jpg")) + list(val_dir.glob("*.jpeg")) + list(val_dir.glob("*.png"))
                     if image_files:
                         val_images_dir = val_dir
                 
-                val_ann_path = find_annotation_file(val_dir)
-                if not val_ann_path:
-                    val_ann_path = val_dir / "annotations.json"
+                if val_images_dir.exists():
+                    val_ann_path = find_annotation_file(val_dir)
+                    if not val_ann_path:
+                        val_ann_path = val_dir / "annotations.json"
+                        if not val_ann_path.exists():
+                            print(f"No annotation file found in {val_dir}")
+                            val_ann_path = None
                     
-                if val_images_dir.exists() and val_ann_path and val_ann_path.exists():
-                    val_dataset = ObjectDetectionDataset(val_images_dir, val_ann_path, transform)
+                    if val_ann_path and val_ann_path.exists():
+                        val_dataset = ObjectDetectionDataset(val_images_dir, val_ann_path, transform)
+                        print(f"Found validation dataset: {val_images_dir} with {val_ann_path}")
             
+            # Check for test set
+            test_dataset = None
+            if test_dir.exists():
+                test_images_dir = test_dir / "images"
+                test_ann_path = None
+                
+                if not test_images_dir.exists():
+                    # Check if images are directly in the test directory
+                    image_files = list(test_dir.glob("*.jpg")) + list(test_dir.glob("*.jpeg")) + list(test_dir.glob("*.png"))
+                    if image_files:
+                        test_images_dir = test_dir
+                
+                if test_images_dir.exists():
+                    test_ann_path = find_annotation_file(test_dir)
+                    if not test_ann_path:
+                        test_ann_path = test_dir / "annotations.json"
+                        if not test_ann_path.exists():
+                            print(f"No annotation file found in {test_dir}")
+                            test_ann_path = None
+                    
+                    if test_ann_path and test_ann_path.exists():
+                        test_dataset = ObjectDetectionDataset(test_images_dir, test_ann_path, transform)
+                        print(f"Found test dataset: {test_images_dir} with {test_ann_path}")
+                        
             class_names = train_dataset.get_class_names()
-        else:
-            # Fall back to case 3
-            print("Alternative structure not found. Falling back to auto-split.")
-            return _create_dataloaders_auto_split(dataset_path, transform, batch_size, val_split, num_workers, collate_fn)
     
-    # Case 3: Auto-split from single dataset
-    else:
+    # Case 3: Direct structure with single annotations.json file at root and images directory
+    # Check if we have a dataset with direct structure: single annotations file and images directory with images directly in it
+    if not pre_split_dataset_found:
+        annotations_file = dataset_path / "annotations.json"
+        images_dir = dataset_path / "images"
+        
+        if annotations_file.exists() and images_dir.exists():
+            # Check if the images directory contains images directly (not in subdirectories)
+            image_files = list(images_dir.glob("*.jpg")) + list(images_dir.glob("*.jpeg")) + list(images_dir.glob("*.png"))
+            
+            if len(image_files) > 0:
+                print(f"Found direct dataset structure with annotations.json and {len(image_files)} images in images directory")
+                
+                # Consider this a pre-split dataset - all data is considered training
+                pre_split_dataset_found = True
+                
+                # Create a dataset using all available images
+                train_dataset = ObjectDetectionDataset(images_dir, annotations_file, transform)
+                class_names = train_dataset.get_class_names()
+                
+                # No val or test datasets in this simple case
+                val_dataset = None
+                test_dataset = None
+                
+                print(f"Direct structure dataset has {len(train_dataset)} samples and {len(class_names)} classes: {class_names}")
+    
+    # Auto-split if no pre-split dataset was found
+    if not pre_split_dataset_found:
         print("Pre-split dataset not detected. Using auto-split.")
-        return _create_dataloaders_auto_split(dataset_path, transform, batch_size, val_split, num_workers, collate_fn)
+        return _create_dataloaders_auto_split(
+            dataset_path, transform, batch_size, val_split, test_split, 
+            num_workers, collate_fn, job_id, use_saved_splits
+        )
+    
+    # If we get here, we've found a pre-split dataset
+    print("Using pre-split dataset - no need to create splits")
     
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
         num_workers=num_workers,
         collate_fn=collate_fn
     )
@@ -310,18 +530,32 @@ def create_dataloaders(dataset_path: str, transform=None, batch_size: int = 4,
             collate_fn=collate_fn
         )
     
-    return train_loader, val_loader, class_names
+    test_loader = None
+    if test_dataset:
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn
+        )
+    
+    return train_loader, val_loader, test_loader, class_names
 
 
-def _create_dataloaders_auto_split(dataset_path, transform, batch_size, val_split, num_workers, collate_fn):
-    """Helper function to create dataloaders with auto-split"""
+def _create_dataloaders_auto_split(dataset_path, transform, batch_size, val_split, test_split, 
+                               num_workers, collate_fn, job_id=None, use_saved_splits=False):
+    """Helper function to create dataloaders with auto-split and support for persistent splits"""
     dataset_path = Path(dataset_path)
+    
+    print(f"Using auto-split dataloaders for {dataset_path}")
     
     # Check for images directory and annotations file
     images_dir = dataset_path / "images"
     if not images_dir.exists():
         # Images might be directly in the dataset_path
         images_dir = dataset_path
+        print(f"No 'images' directory found, using {images_dir} as images directory")
     
     # Find annotations file
     annotations_path = find_annotation_file(dataset_path)
@@ -330,6 +564,8 @@ def _create_dataloaders_auto_split(dataset_path, transform, batch_size, val_spli
         annotations_dir = dataset_path / "annotations"
         if annotations_dir.exists():
             annotations_path = find_annotation_file(annotations_dir)
+            if annotations_path:
+                print(f"Found annotations file in annotations directory: {annotations_path}")
     
     if not annotations_path:
         raise ValueError(f"Cannot find annotations file in {dataset_path}")
@@ -342,24 +578,59 @@ def _create_dataloaders_auto_split(dataset_path, transform, batch_size, val_spli
     # Get class names
     class_names = dataset.get_class_names()
     
-    # Split dataset into train and validation
-    dataset_size = len(dataset)
-    val_size = int(val_split * dataset_size)
-    train_size = dataset_size - val_size
+    # Try to load saved splits if requested and job_id is provided
+    splits = None
+    if job_id:  # Only try to load/save splits if job_id is provided
+        if use_saved_splits:
+            try:
+                print(f"Attempting to load saved splits for job ID {job_id}...")
+                splits = ObjectDetectionDataset.load_splits(job_id)
+                if (str(Path(images_dir).absolute()) != str(Path(splits['dataset_path']).absolute()) or
+                    str(Path(annotations_path).absolute()) != str(Path(splits['annotations_path']).absolute())):
+                    print(f"Warning: Saved splits are for a different dataset. Creating new splits.")
+                    splits = None
+                else:
+                    print(f"Successfully loaded saved splits for job ID {job_id}")
+            except FileNotFoundError:
+                print(f"No saved splits found for job ID {job_id}. Creating new splits.")
+        else:
+            print(f"Not using saved splits. Creating new splits for job ID {job_id}")
+    else:
+        print(f"No job ID provided. Creating temporary splits (will not be saved)")
     
-    if val_size > 0:
-        # Use random split if validation set is requested
-        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-        
-        # Create data loaders
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            collate_fn=collate_fn
-        )
-        
+    # Create and save splits if not loaded
+    if splits is None:
+        if job_id:
+            print(f"Creating and saving new splits for job ID {job_id}")
+            splits = dataset.create_and_save_splits(
+                val_split=val_split,
+                test_split=test_split,
+                job_id=job_id
+            )
+        else:
+            print(f"Creating temporary splits (not saving to disk)")
+            splits = dataset._create_splits(
+                val_split=val_split,
+                test_split=test_split
+            )
+    
+    # Create dataset subsets
+    print(f"Creating dataset subsets: {len(splits['train'])} train, {len(splits['val'])} val, {len(splits['test'])} test samples")
+    train_dataset = Subset(dataset, splits['train'])
+    val_dataset = Subset(dataset, splits['val']) if len(splits['val']) > 0 else None
+    test_dataset = Subset(dataset, splits['test']) if len(splits['test']) > 0 else None
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_fn
+    )
+    
+    val_loader = None
+    if val_dataset and len(val_dataset) > 0:
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
@@ -367,15 +638,15 @@ def _create_dataloaders_auto_split(dataset_path, transform, batch_size, val_spli
             num_workers=num_workers,
             collate_fn=collate_fn
         )
-    else:
-        # Use the entire dataset for training if no validation is requested
-        train_loader = DataLoader(
-            dataset,
+    
+    test_loader = None
+    if test_dataset and len(test_dataset) > 0:
+        test_loader = DataLoader(
+            test_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=num_workers,
             collate_fn=collate_fn
         )
-        val_loader = None
     
-    return train_loader, val_loader, class_names
+    return train_loader, val_loader, test_loader, class_names

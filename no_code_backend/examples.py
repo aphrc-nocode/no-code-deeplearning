@@ -130,6 +130,15 @@ async def run_image_classification_example(dataset_path: str):
                 print(f"  {name}: {value:.4f}")
             else:
                 print(f"  {name}: {value}")
+        
+        # Clean up dataset split files
+        from datasets_module.classification.dataloaders import ImageClassificationDataset
+        print("Cleaning up dataset split files...")
+        try:
+            ImageClassificationDataset.cleanup_splits("example_classification")
+            print("Dataset split files cleaned up successfully")
+        except Exception as e:
+            print(f"Error cleaning up dataset splits: {e}")
 
 async def run_object_detection_example(dataset_path: str):
     """Run object detection pipeline example"""
@@ -235,7 +244,7 @@ async def run_object_detection_example(dataset_path: str):
 
         # Evaluate the model
         from evaluate_model import evaluate_detection_model
-        evaluation_result = evaluate_detection_model(model, dataset_path, batch_size=config.batch_size)
+        evaluation_result = evaluate_detection_model(model, dataset_path, batch_size=config.batch_size, job_id="example_detection")
         
         print("Evaluation Metrics:")
         for name, value in evaluation_result.items():
@@ -243,6 +252,24 @@ async def run_object_detection_example(dataset_path: str):
                 print(f"  {name}: {value:.4f}")
             else:
                 print(f"  {name}: {value}")
+        
+        # Clean up any dataset split files
+        try:
+            from datasets_module.detection.dataloaders import ObjectDetectionDataset
+            print("Cleaning up object detection dataset split files...")
+            ObjectDetectionDataset.cleanup_splits("example_detection")
+            print("Object detection dataset split files cleaned up successfully")
+            
+            # Also clean up any model directories created in models/
+            from pathlib import Path
+            model_dir = Path("models") / "example_detection"
+            if model_dir.exists():
+                import shutil
+                print(f"Cleaning up model directory: {model_dir}")
+                shutil.rmtree(model_dir)
+                print(f"Removed directory: {model_dir}")
+        except Exception as e:
+            print(f"Error cleaning up files: {e}")
 
 async def run_semantic_segmentation_example(dataset_path: str):
     """Run semantic segmentation pipeline example"""
@@ -354,9 +381,9 @@ async def main():
         return
     
     # Run examples
-    await run_image_classification_example(test_dataset_path)
+    # await run_image_classification_example(test_dataset_path)
     # Uncomment to run other examples once you have appropriate datasets
-    # await run_object_detection_example("/home/achuka/object-detect")
+    await run_object_detection_example("/home/achuka/object-detect")
     # await run_semantic_segmentation_example("datasets/segmentation_data")
     # await run_instance_segmentation_example("datasets/instance_seg_data")
     

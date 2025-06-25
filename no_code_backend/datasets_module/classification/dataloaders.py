@@ -133,6 +133,62 @@ class ImageClassificationDataset(Dataset):
             splits = json.load(f)
         
         return splits
+    
+    @staticmethod
+    def cleanup_splits(job_id: str) -> None:
+        """Delete split files for a specific job_id
+        
+        Args:
+            job_id: Job ID to clean up splits for
+        """
+        # Primary location (new)
+        splits_dir = Path("dataset_splits") / job_id
+        
+        # Secondary location (legacy)
+        legacy_splits_dir = Path("models") / job_id / "splits"
+        
+        # Print debug info
+        print(f"Cleaning up split files for job_id: {job_id}")
+        
+        # Check if primary directory exists and delete files
+        if splits_dir.exists():
+            print(f"Found splits directory at {splits_dir}")
+            try:
+                for file in splits_dir.glob("*.json"):
+                    print(f"Removing file: {file}")
+                    file.unlink()
+                
+                # Remove the directory if it's empty
+                if not any(splits_dir.iterdir()):
+                    print(f"Removing empty directory: {splits_dir}")
+                    splits_dir.rmdir()
+                
+                print(f"Split files cleanup completed for {splits_dir}")
+            except Exception as e:
+                print(f"Error during cleanup: {e}")
+        
+        # Check if legacy directory exists and delete files
+        if legacy_splits_dir.exists():
+            print(f"Found legacy splits directory at {legacy_splits_dir}")
+            try:
+                for file in legacy_splits_dir.glob("*.json"):
+                    print(f"Removing file: {file}")
+                    file.unlink()
+                
+                # Remove the directory if it's empty
+                if not any(legacy_splits_dir.iterdir()):
+                    print(f"Removing empty directory: {legacy_splits_dir}")
+                    legacy_splits_dir.rmdir()
+                    
+                    # Try to remove parent directory if it's empty
+                    parent_dir = legacy_splits_dir.parent
+                    if parent_dir.exists() and not any(parent_dir.iterdir()):
+                        print(f"Removing empty parent directory: {parent_dir}")
+                        parent_dir.rmdir()
+                
+                print(f"Legacy split files cleanup completed for {legacy_splits_dir}")
+            except Exception as e:
+                print(f"Error during legacy cleanup: {e}")
 
 def create_dataloaders(dataset_path: str, transform, batch_size: int = 32, 
                       val_split: float = 0.2, test_split: float = 0.1,

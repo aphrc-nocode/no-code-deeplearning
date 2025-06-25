@@ -63,10 +63,10 @@ def log_batch_metrics(metrics: Dict[str, Any], step: int):
     """Log batch metrics to the current MLflow run"""
     log_metrics(metrics, step)
 
-def log_model(model, model_path: str, class_to_idx: Dict = None, config: Dict = None):
+def log_model(model, artifact_path: str = "model", class_to_idx: Dict = None, config: Dict = None):
     """Log model and associated metadata to MLflow"""
-    # Log the PyTorch model
-    mlflow.pytorch.log_model(model, "model")
+    # Log the PyTorch model - fix for the artifact_path vs name warning
+    mlflow.pytorch.log_model(model, artifact_path)
     
     # Log class mapping if provided
     if class_to_idx:

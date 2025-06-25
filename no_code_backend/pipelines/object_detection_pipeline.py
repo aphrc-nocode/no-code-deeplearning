@@ -47,12 +47,29 @@ class ObjectDetectionPipeline(BasePipeline):
                 "initial_learning_rate": self.config.learning_rate
             })
             
-            # Create datasets and data loaders
+            # Create datasets and data loaders with persistent splits
             transform = self.get_transforms()
-            train_loader, val_loader, classes = create_dataloaders(
+            
+            # Analyze dataset structure before creating dataloaders
+            dataset_path = Path(dataset_path)
+            has_presplit_structure = False
+            
+            # Check for common pre-split dataset structures
+            if (dataset_path / "train").exists() or \
+               ((dataset_path / "images").exists() and (dataset_path / "annotations").exists() and 
+                (dataset_path / "annotations" / "instances_train.json").exists()):
+                await self._update_job_log(job_id, f"Detected pre-split dataset structure in {dataset_path}")
+                has_presplit_structure = True
+            
+            # Use saved splits for validation/evaluation, but create new splits for training
+            await self._update_job_log(job_id, f"Creating dataloaders for dataset: {dataset_path}")
+            train_loader, val_loader, test_loader, classes = create_dataloaders(
                 dataset_path, transform, 
                 batch_size=self.config.batch_size,
-                val_split=0.2 if self.config.early_stopping else 0.0
+                val_split=0.2 if self.config.early_stopping else 0.1,
+                test_split=0.1,
+                job_id=job_id,  # Pass job_id to ensure splits persistence
+                use_saved_splits=False  # Create new splits for this training run
             )
             
             # Store class mapping
@@ -226,18 +243,22 @@ class ObjectDetectionPipeline(BasePipeline):
             mlflow_models_dir.mkdir(parents=True, exist_ok=True)
             
             # Save class mapping separately for easier loading
-            class_mapping_path = mlflow_models_dir / f"{job_id}_class_mapping.json"
+            class_mapping_path = Path("class_mapping.json")  # Temporary file
             import json
             with open(class_mapping_path, 'w') as f:
                 json.dump(class_to_idx, f)
             
-            # Log model to MLflow
-            log_model(
-                model=model,
-                model_path="model",
-                class_to_idx=class_to_idx,
-                config=self.config.dict()
-            )
+            # Log class mapping as artifact
+            mlflow.log_artifact(str(class_mapping_path), "metadata")
+            
+            # Clean up the temporary file
+            if class_mapping_path.exists():
+                class_mapping_path.unlink()                # Log model directly to MLflow
+                try:
+                    mlflow.pytorch.log_model(model, artifact_path="model")
+                    await self._update_job_log(job_id, "Model logged to MLflow successfully")
+                except Exception as e:
+                    await self._update_job_log(job_id, f"Error logging model to MLflow: {str(e)}")
             
             # Get MLflow run info to use as model path
             run_info = mlflow.active_run()
@@ -247,7 +268,7 @@ class ObjectDetectionPipeline(BasePipeline):
                 # Use our custom MLflow models directory
                 run_id = run_info.info.run_id
                 model_output_path = mlflow_models_dir / run_id
-                model_output_path.mkdir(exist_ok=True)
+                model_output_path.mkdir(parents=True, exist_ok=True)
                 
                 # Save a copy of the model to our custom directory
                 final_model_path = model_output_path / "model.pth"
@@ -256,9 +277,6 @@ class ObjectDetectionPipeline(BasePipeline):
                     'class_to_idx': class_to_idx,
                     'config': self.config.dict()
                 }, final_model_path)
-                
-                # Log the local path as an artifact
-                mlflow.log_artifact(str(final_model_path))
                 
                 # Use the directory as the return path
                 local_model_path = str(model_output_path)
@@ -343,10 +361,112 @@ class ObjectDetectionPipeline(BasePipeline):
                 "labels": labels.tolist()
             }
     
-    async def evaluate(self, dataset_path: str) -> Dict[str, Any]:
-        """Evaluate the model on a test dataset"""
-        # Implementation for evaluation on test dataset
-        pass
+    async def evaluate(self, dataset_path: str, model_path: str = None, job_id: str = None) -> Dict[str, Any]:
+        """
+        Evaluate the model on a test dataset
+        
+        Args:
+            dataset_path: Path to test dataset
+            model_path: Path to saved model (if None, will use self.model)
+            job_id: Optional job ID for logging
+            
+        Returns:
+            Dictionary with evaluation metrics
+        """
+        try:
+            # Load model if path is provided
+            if model_path:
+                checkpoint = torch.load(model_path)
+                model = self.create_model()
+                model.load_state_dict(checkpoint['model_state_dict'])
+                class_to_idx = checkpoint.get('class_to_idx', {})
+            else:
+                # Ensure we have a model to evaluate
+                raise ValueError("Model path must be provided for evaluation")
+                
+            # Set model to evaluation mode
+            model.eval()
+            
+            # Get transforms for evaluation
+            transform = self.get_transforms()
+            
+            # Check if we have a test directory
+            test_dir = Path(dataset_path) / "test"
+            if test_dir.exists():
+                print(f"Using dedicated test directory: {test_dir}")
+                # Use the test directory exclusively
+                _, _, test_loader, classes = create_dataloaders(
+                    str(test_dir), transform,
+                    batch_size=self.config.batch_size,
+                    val_split=0.0,  # No further splitting needed
+                    test_split=0.0,  # No further splitting needed
+                    shuffle=False    # No need to shuffle for evaluation
+                )
+            else:
+                # No test directory, try to load saved splits
+                try:
+                    print(f"Looking for saved splits from training job: {job_id}")
+                    # Create a loader using the saved test split
+                    _, _, test_loader, classes = create_dataloaders(
+                        dataset_path, transform,
+                        batch_size=self.config.batch_size,
+                        job_id=job_id,             # Use job_id to find splits
+                        use_saved_splits=True,     # Use the persistent splits
+                        shuffle=False
+                    )
+                    print(f"Using saved test split with {len(test_loader.dataset)} samples")
+                except Exception as e:
+                    print(f"Could not load saved splits: {e}")
+                    print("Falling back to validation split approach")
+                    # Fallback to using validation directory or creating new split
+                    val_dir = Path(dataset_path) / "val"
+                    if val_dir.exists():
+                        print(f"Using validation directory: {val_dir}")
+                        _, _, test_loader, classes = create_dataloaders(
+                            str(val_dir), transform,
+                            batch_size=self.config.batch_size,
+                            val_split=0.0,
+                            test_split=0.0,
+                            shuffle=False
+                        )
+                    else:
+                        # If no test or val directory, and no saved splits,
+                        # create a new split and use test split
+                        print(f"No dedicated test/val directory or saved splits. Creating a temporary test split.")
+                        _, _, test_loader, classes = create_dataloaders(
+                            dataset_path, transform,
+                            batch_size=self.config.batch_size,
+                            val_split=0.1,
+                            test_split=0.1,
+                            shuffle=False
+                        )
+            
+            # Evaluate on the test set
+            # Implementation for detection evaluation
+            # Calculate mAP and other metrics
+            
+            # Clean up splits after evaluation if they won't be used again
+            if job_id:
+                from datasets_module.detection.dataloaders import ObjectDetectionDataset
+                print("Cleaning up dataset split files...")
+                ObjectDetectionDataset.cleanup_splits(job_id)
+            
+            return {
+                "status": "completed",
+                "mAP": 0.0,  # Placeholder
+                "AP50": 0.0,  # Placeholder
+                "AP75": 0.0,  # Placeholder
+                "APs": 0.0,   # Small objects
+                "APm": 0.0,   # Medium objects
+                "APl": 0.0,   # Large objects
+            }
+            
+        except Exception as e:
+            print(f"Error during evaluation: {str(e)}")
+            return {
+                "status": "failed",
+                "error": str(e)
+            }
     
     @staticmethod
     def get_metrics() -> List[str]:

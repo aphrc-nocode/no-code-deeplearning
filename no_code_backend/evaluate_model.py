@@ -204,9 +204,18 @@ def evaluate_classification_model(model, dataset_path: Union[str, Path], batch_s
         print(f"Prediction class distribution: {dict(pred_distribution)}")
         print(f"Target class distribution: {dict(target_distribution)}")
     
+    # Clean up split files after evaluation if job_id is provided
+    if job_id:
+        try:
+            from datasets_module.classification.dataloaders import ImageClassificationDataset
+            print(f"Cleaning up classification dataset split files for job {job_id}...")
+            ImageClassificationDataset.cleanup_splits(job_id)
+        except Exception as e:
+            print(f"Error during split cleanup: {e}")
+    
     return metrics
 
-def evaluate_detection_model(model, dataset_path: Union[str, Path], batch_size: int = 4) -> Dict[str, Any]:
+def evaluate_detection_model(model, dataset_path: Union[str, Path], batch_size: int = 4, job_id: str = None) -> Dict[str, Any]:
     """
     Evaluate an object detection model on a test dataset
     
@@ -214,20 +223,30 @@ def evaluate_detection_model(model, dataset_path: Union[str, Path], batch_size: 
         model: The model to evaluate
         dataset_path: Path to the test dataset
         batch_size: Batch size for evaluation
+        job_id: Optional job ID for loading saved splits
         
     Returns:
         Dict with evaluation metrics
     """
-    from datasets_module.detection.dataloaders import create_dataloaders
-    from datasets_module.detection.transforms import get_detection_transforms
+    from datasets_module.detection.dataloaders import create_dataloaders, ObjectDetectionDataset
     from metrics.detection.metrics import calculate_detection_metrics
     import torch
+    from torch.utils.data import DataLoader
     
     # Set model to evaluation mode
     model.eval()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    print(f"Using device: {device}")
+    
+    print(f"Evaluating detection model on {dataset_path}")
+    
+    # Flag to track if we created splits that need cleanup
+    created_splits = False
     
     # Get detection transforms for test set (evaluation mode)
     try:
+        from datasets_module.detection.transforms import get_detection_transforms
         transform = get_detection_transforms(train=False)
         print("Using evaluation transforms for detection model")
     except Exception as e:
@@ -239,140 +258,162 @@ def evaluate_detection_model(model, dataset_path: Union[str, Path], batch_size: 
     dataset_path = Path(dataset_path)
     test_dir = dataset_path / "test"
     
-    if test_dir.exists():
-        print(f"Found test directory: {test_dir}")
-        # Use the test directory for evaluation
-        train_loader, test_loader, classes = create_dataloaders(
-            test_dir,
+    # Helper function to check if a directory has valid image files
+    def has_valid_images(directory):
+        image_files = list(directory.glob("**/*.jpg")) + list(directory.glob("**/*.jpeg")) + list(directory.glob("**/*.png"))
+        return len(image_files) > 0
+    
+    # Try to create data loaders using our standard function
+    try:
+        train_loader, val_loader, test_loader, classes = create_dataloaders(
+            dataset_path,
             transform=transform,
             batch_size=batch_size,
-            val_split=0.0,  # No need to split test data further
+            val_split=0.2,
+            test_split=0.2,
+            job_id=job_id,
+            use_saved_splits=job_id is not None
         )
-        # Use the training loader for test since val_split=0.0
-        test_loader = train_loader
-    else:
-        # Look for val directory instead as second option
-        val_dir = dataset_path / "val"
-        if val_dir.exists():
-            print(f"Found validation directory: {val_dir}")
-            # Use the validation directory for evaluation
-            train_loader, test_loader, classes = create_dataloaders(
-                val_dir,
-                transform=transform,
-                batch_size=batch_size,
-                val_split=0.0,  # No need to split val data further
-            )
-            # Use the training loader for test since val_split=0.0
-            test_loader = train_loader
-        else:
-            # If no test or val directory, create a validation split from the main dataset
-            print("No dedicated test or validation directory found. Creating validation split from dataset.")
-            train_loader, test_loader, classes = create_dataloaders(
-                dataset_path,
-                transform=transform,
-                batch_size=batch_size,
-                val_split=0.2,  # Create validation split for testing
-            )
-            
-            # If even with splitting we couldn't get a validation set, use a small portion of training data
-            if test_loader is None:
-                print("WARNING: No validation set could be created. Using the training set for evaluation.")
-                # Just use the training data for evaluation in this case
-                test_loader = train_loader
-                
-                # We could alternatively create a manual split, but there's likely a reason the dataset
-                # couldn't be split correctly (e.g., too few samples)
-                '''
-                from torch.utils.data import random_split
-                
-                # Get the dataset from the train_loader
-                train_dataset = train_loader.dataset
-                test_size = max(1, int(0.2 * len(train_dataset)))  # Ensure at least 1 sample
-                train_size = len(train_dataset) - test_size
-                
-                print(f"Manually splitting train dataset: {len(train_dataset)} total samples -> {train_size} train, {test_size} test")
-                
-                # Create a random split
-                train_subset, test_subset = random_split(
-                    train_dataset, [train_size, test_size]
-                )
-                
-                # Create a new dataloader for testing
-                from torch.utils.data import DataLoader
-                test_loader = DataLoader(
-                    test_subset,
-                    batch_size=batch_size,
-                    shuffle=False,
-                    collate_fn=train_loader.collate_fn
-                )
-                '''
-    
-    try:
-        # This is just placeholder to keep the try-except structure consistent
-        pass
-        
     except Exception as e:
         print(f"Error creating dataloaders: {e}")
-        raise
+        train_loader = val_loader = test_loader = None
+        classes = []
     
-    # Ensure model is on the correct device
-    device = next(model.parameters()).device
-    print(f"Using device: {device}")
+    # If we don't have a test loader, try alternative approaches
+    if test_loader is None:
+        # Check for annotations file and images directory
+        annotations_file = dataset_path / "annotations.json"
+        images_dir = dataset_path / "images"
+        
+        if annotations_file.exists() and images_dir.exists():
+            print(f"Creating test dataset directly from {images_dir} and {annotations_file}")
+            
+            # Create dataset
+            dataset = ObjectDetectionDataset(images_dir, annotations_file, transform)
+            classes = dataset.get_class_names()
+            
+            # Since we don't have a dedicated test set, we'll use the whole dataset
+            print(f"Using all {len(dataset)} samples for evaluation")
+            
+            # Create data loader
+            test_loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=lambda b: tuple(zip(*b))
+            )
+        else:
+            # Look for any JSON file in the dataset directory
+            import glob
+            json_files = glob.glob(str(dataset_path / "*.json"))
+            if json_files:
+                annotations_file = Path(json_files[0])
+                print(f"Found annotations file: {annotations_file}")
+                
+                # Try to create dataset
+                try:
+                    dataset = ObjectDetectionDataset(dataset_path, annotations_file, transform)
+                    classes = dataset.get_class_names()
+                    
+                    # Create test loader
+                    test_loader = DataLoader(
+                        dataset,
+                        batch_size=batch_size,
+                        shuffle=False,
+                        collate_fn=lambda b: tuple(zip(*b))
+                    )
+                except Exception as e:
+                    print(f"Error creating dataset: {e}")
+                    test_loader = None
     
-    # Lists to collect predictions and targets
+    # Ensure we have a test loader
+    if test_loader is None:
+        raise ValueError("Failed to create a test dataset for evaluation")
+    
+    print(f"Evaluating on test dataset with {len(test_loader)} batches")
+    
+    # Run evaluation
+    model.eval()
     all_detections = []
     all_targets = []
     
-    # Print info about the test loader
-    num_batches = len(test_loader) if hasattr(test_loader, "__len__") else "unknown"
-    print(f"Evaluating on test dataset with {num_batches} batches")
-    
-    # Counter for tracking progress
-    batch_count = 0
-    
     with torch.no_grad():
-        try:
-            for images, targets in test_loader:
-                batch_count += 1
-                print(f"Processing batch {batch_count}")
-                
-                # Move data to device
-                images = [img.to(device) for img in images]
-                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-                
-                # Run forward pass
-                outputs = model(images)
-                
-                # Check if we got valid outputs
-                print(f"Batch {batch_count}: Found {len(outputs)} predictions")
-                
-                # Add detections and targets for metric calculation
-                all_detections.extend(outputs)
-                all_targets.extend(targets)
-        except Exception as e:
-            print(f"Error during evaluation: {e}")
-            import traceback
-            traceback.print_exc()
+        for batch_idx, (images, targets) in enumerate(test_loader):
+            print(f"Processing batch {batch_idx + 1}")
+            images = [img.to(device) for img in images]
+            
+            # Run inference
+            outputs = model(images)
+            
+            # Store detections and targets for metrics calculation
+            all_detections.extend(outputs)
+            all_targets.extend(targets)
+            
+            print(f"Batch {batch_idx + 1}: Found {len(outputs)} predictions")
     
-    # Calculate metrics
     print(f"Calculating metrics on {len(all_detections)} predictions")
     
-    if len(all_detections) > 0:
-        metrics = calculate_detection_metrics(all_detections, all_targets)
-    else:
-        print("WARNING: No predictions to evaluate. Using default metrics.")
-        metrics = {
-            "mAP": 0.0,
-            "AP50": 0.0,
-            "AP75": 0.0,
-            "error": "No predictions available for evaluation"
-        }
+    # Calculate metrics
+    metrics = calculate_detection_metrics(all_detections, all_targets)
+    metrics["num_test_samples"] = len(test_loader.dataset)
+    metrics["num_test_batches"] = len(test_loader)
     
-    # Add number of test samples to the metrics
-    metrics['num_test_samples'] = len(all_detections)
-    metrics['num_test_batches'] = batch_count
+    # Print evaluation results
+    print("\nEvaluation Metrics:")
+    for metric_name, value in metrics.items():
+        if isinstance(value, float):
+            print(f"  {metric_name}: {value:.4f}")
+        else:
+            print(f"  {metric_name}: {value}")
+    
+    # Clean up split files only if we created them
+    if job_id:
+        try:
+            print(f"Cleaning up detection dataset split files for job {job_id}...")
+            splits_dir = Path("dataset_splits") / job_id
+            if splits_dir.exists():
+                ObjectDetectionDataset.cleanup_splits(job_id)
+                print(f"Detection dataset split files cleaned up successfully")
+            else:
+                print(f"No splits directory found at {splits_dir}, nothing to clean up")
+                
+        except Exception as e:
+            print(f"Error during split cleanup: {e}")
     
     return metrics
+
+def find_annotations_file(directory):
+    """Helper to find annotations file in a directory"""
+    from pathlib import Path
+    
+    # Common names for annotation files
+    priority_names = ["annotations.json", "instances.json", "coco.json"]
+    
+    # First try direct matches
+    for name in priority_names:
+        ann_file = directory / name
+        if ann_file.exists():
+            return ann_file
+    
+    # Then try any JSON file
+    json_files = list(directory.glob("*.json"))
+    if json_files:
+        return json_files[0]
+    
+    # Try in annotations subdirectory
+    ann_dir = directory / "annotations"
+    if ann_dir.exists():
+        for name in priority_names:
+            ann_file = ann_dir / name
+            if ann_file.exists():
+                return ann_file
+        
+        # Try any JSON in annotations dir
+        json_files = list(ann_dir.glob("*.json"))
+        if json_files:
+            return json_files[0]
+    
+    return None
 
 def evaluate_segmentation_model(model, dataset_path: Union[str, Path], batch_size: int = 4) -> Dict[str, Any]:
     """
