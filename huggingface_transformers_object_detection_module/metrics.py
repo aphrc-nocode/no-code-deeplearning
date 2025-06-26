@@ -44,9 +44,19 @@ def compute_metrics(evaluation_results, image_processor, threshold=0.0, id2label
     metric.update(post_processed_predictions, post_processed_targets)
     metrics = metric.compute()
 
+    # Pop class-specific metrics
     classes = metrics.pop("classes")
     map_per_class = metrics.pop("map_per_class")
     mar_100_per_class = metrics.pop("mar_100_per_class")
+
+    # Handle cases where metrics are 0-dimensional tensors
+    if isinstance(classes, torch.Tensor) and classes.dim() == 0:
+        classes = [classes]
+    if isinstance(map_per_class, torch.Tensor) and map_per_class.dim() == 0:
+         map_per_class = [map_per_class]
+    if isinstance(mar_100_per_class, torch.Tensor) and mar_100_per_class.dim() == 0:
+         mar_100_per_class = [mar_100_per_class]
+
     for class_id, class_map, class_mar in zip(classes, map_per_class, mar_100_per_class):
         class_name = id2label.get(class_id.item(), class_id.item())
         metrics[f"map_{class_name}"] = class_map

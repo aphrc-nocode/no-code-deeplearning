@@ -1,33 +1,35 @@
-import albumentations
+import albumentations as A
 
-def get_train_transform(max_image_size=800):
+def get_train_transform(max_image_size=512):
     """Returns the training augmentation pipeline."""
-    return albumentations.Compose(
+    return A.Compose(
         [
-            albumentations.OneOf([
-                albumentations.HorizontalFlip(p=0.9),
-                albumentations.VerticalFlip(p=0.6)
-            ], p=0.8),
-            albumentations.OneOf([
-                albumentations.ColorJitter(p=0.5),
-                albumentations.RandomBrightnessContrast(p=0.5),
-                albumentations.HueSaturationValue(p=0.5),
-                albumentations.CLAHE(p=0.5),
-                albumentations.RandomGamma(p=0.5),
-            ], p=0.8),
-            albumentations.BBoxSafeRandomCrop(erosion_rate=0.5, p=0.5),
-            albumentations.LongestMaxSize(max_size=max_image_size),
-            albumentations.PadIfNeeded(max_image_size, max_image_size, border_mode=0, position="center"),
+            A.Compose(
+                [
+                    A.SmallestMaxSize(max_size=max_image_size, p=1.0),
+                    A.RandomSizedBBoxSafeCrop(height=max_image_size, width=max_image_size, p=1.0),
+                ],
+                p=0.2,
+            ),
+            A.OneOf(
+                [
+                    A.Blur(blur_limit=7, p=0.5),
+                    A.MotionBlur(blur_limit=7, p=0.5),
+                    A.Defocus(radius=(1, 5), alias_blur=(0.1, 0.25), p=0.1),
+                ],
+                p=0.1,
+            ),
+            A.Perspective(p=0.1),
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(p=0.5),
+            A.HueSaturationValue(p=0.1),
         ],
-        bbox_params=albumentations.BboxParams(format="coco", label_fields=["category"], clip=True, min_visibility=0.5),
+        bbox_params=A.BboxParams(format="coco", label_fields=["category"], clip=True, min_area=25),
     )
 
-def get_validation_transform(max_image_size=800):
-    """Returns the validation transformation pipeline."""
-    return albumentations.Compose(
-        [
-            albumentations.LongestMaxSize(max_size=max_image_size),
-            albumentations.PadIfNeeded(max_image_size, max_image_size, border_mode=0, position="center"),
-        ],
-        bbox_params=albumentations.BboxParams(format="coco", label_fields=["category"], clip=True),
+def get_validation_transform():
+    """Returns the validation transformation pipeline (no augmentations)."""
+    return A.Compose(
+        [A.NoOp()],
+        bbox_params=A.BboxParams(format="coco", label_fields=["category"], clip=True),
     )
