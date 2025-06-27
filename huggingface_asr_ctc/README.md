@@ -1,6 +1,6 @@
-# Wav2Vec2-BERT Fine-Tuning for Automatic Speech Recognition (ASR)
+# Fine-Tuning for Connectionist Temporal Classification (CTC) Automatic Speech Recognition (ASR)
 
-This project provides a comprehensive pipeline for fine-tuning the Wav2Vec2-BERT model for Automatic Speech Recognition (ASR) tasks. The scripts are designed to be modular, configurable, and easy to use, allowing for robust experimentation with different datasets and training parameters.
+This project provides a comprehensive pipeline for fine-tuning any pretrained Connectionist Temporal Classification (CTC) model for Automatic Speech Recognition (ASR) tasks. The scripts are designed to be modular, configurable, and easy to use, allowing for robust experimentation with different datasets and training parameters.
 
 ## Getting Started
 
@@ -27,11 +27,29 @@ source asr_env/bin/activate  # On Windows, use `asr_env\Scripts\activate`
 2.  **Install the required packages:**
 
     ```bash
-    pip install torch datasets transformers evaluate wandb numpy pandas
-    pip install 'accelerate>=0.21.0'
+    pip install -r requirements.txt
     ```
 
     *Note: For GPU support, ensure you have the correct version of PyTorch installed for your CUDA version. See the [official PyTorch website](https://pytorch.org/get-started/locally/) for installation instructions.*
+
+## Data Directory Structure
+
+Store your dataset in a directory structure like:
+
+```bash
+data_dir/train/metadata.csv
+data_dir/train/0001.mp3
+data_dir/train/0002.mp3
+data_dir/train/0003.mp3
+```
+
+Your metadata.csv file must have a file_name column which links audio files with their transcript e.g.:
+
+```bash
+file_name,sentence
+0001.mp3,This is a transcript for 0001.mp3
+0002.mp3,This is a transcript for 0002.mp3
+```
 
 ## Usage
 
@@ -72,11 +90,8 @@ Here is a list of all available arguments to configure the training pipeline:
 | `--output_dir_prefix` | `str` | `w2v-bert-2.0-en-finetuned` | Prefix for the output directory. |
 | `--model_version` | `str` | `v0.0` | Version for the trained model. |
 | `--vocab_file_path` | `str` | `./vocab.json` | Path to save the vocabulary file. |
-| `--audio_column` | `str` | `audio` | Column name for audio data. |
-| `--duration_column` | `str` | `duration` | Column name for audio duration. |
 | `--speaker_id_column` | `str` | `None` | Column name for speaker ID. |
-| `--text_column` | `str` | `sentence` | Column name for original transcript. |
-| `--normalized_text_column` | `str` | `normalized_text` | Column name for cleaned transcript. |
+| `--text_column` | `str` | `sentence` | Column name for transcript. |
 | `--target_sampling_rate` | `int` | `16000` | Target sampling rate for audio. |
 | `--min_duration_s` | `float` | `1.0` | Minimum audio duration in seconds. |
 | `--max_duration_s` | `float` | `30.0` | Maximum audio duration in seconds. |
