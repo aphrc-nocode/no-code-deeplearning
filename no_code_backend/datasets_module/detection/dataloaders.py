@@ -45,7 +45,7 @@ class ObjectDetectionDataset(Dataset):
           ├── train/
           │   ├── images/
           │   ├── annotations.json
-          ├── val/
+          ├── vali/
           │   ├── images/
           │   ├── annotations.json
           ├── test/

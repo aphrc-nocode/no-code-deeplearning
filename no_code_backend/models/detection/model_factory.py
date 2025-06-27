@@ -1,13 +1,31 @@
 """
 Factory for creating object detection models.
-This module provides functionality to create various pre-trained models for object detection.
+This module provides functionality to create various pre-trained models for object detection,
+including PyTorch native models and Hugging Face transformers.
 """
 import torch
 import torch.nn as nn
 import torchvision
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
-from typing import Optional
+from typing import Optional, Dict, Any
+
+# Check if transformers is available
+try:
+    import transformers
+    from transformers import AutoModelForObjectDetection, AutoImageProcessor
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+
+# Map architecture enum values to HF model checkpoints
+HF_MODEL_MAPPING = {
+    "detr_resnet50": "facebook/detr-resnet-50",
+    "detr_resnet101": "facebook/detr-resnet-101",
+    "yolos_small": "hustvl/yolos-small",
+    "yolos_base": "hustvl/yolos-base",
+    "owlv2_base": "owlv2-base-patch16-ensemble",
+}
 
 def create_model(architecture: str, num_classes: int, pretrained: bool = True) -> nn.Module:
     """
@@ -21,6 +39,17 @@ def create_model(architecture: str, num_classes: int, pretrained: bool = True) -
     Returns:
         Object detection model
     """
+    # Check if the architecture is a Hugging Face transformer
+    if architecture in HF_MODEL_MAPPING:
+        if not HF_AVAILABLE:
+            raise ImportError("Hugging Face transformers is not installed. Please install with pip install transformers")
+        
+        # For HF models, we don't create them here 
+        # They'll be initialized in the pipeline's _train_with_hf_transformers method
+        # Just return None to signal that this is a HF model
+        return None
+        
+    # Standard PyTorch models
     weights = 'DEFAULT' if pretrained else None
     
     if architecture == "faster_rcnn":

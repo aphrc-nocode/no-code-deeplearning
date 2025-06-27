@@ -90,6 +90,12 @@ class ImageClassificationPipeline(BasePipeline):
             best_model_state = None
             patience_counter = 0
             
+            # Initialize variables to prevent "referenced before assignment" errors
+            epoch = 0
+            all_preds = []
+            all_targets = []
+            all_scores = []
+            
             # Track metrics for visualization
             train_losses = []
             train_accs = []
@@ -170,11 +176,6 @@ class ImageClassificationPipeline(BasePipeline):
                 # Validation phase
                 val_loss = 0.0
                 val_acc = 0.0
-                
-                # Collect predictions and targets for confusion matrix at final epoch
-                all_preds = []
-                all_targets = []
-                all_scores = []
                 
                 if val_loader:
                     model.eval()
@@ -288,13 +289,17 @@ class ImageClassificationPipeline(BasePipeline):
                 model.load_state_dict(best_model_state)
                 await self._update_job_log(job_id, "Loaded best model from checkpoints")
             elif self.config.early_stopping:
-                # Try to get best model from MLflow
-                try:
-                    best_model_dict = mlflow.pytorch.load_state_dict("best_model_checkpoint")
-                    model.load_state_dict(best_model_dict)
-                    await self._update_job_log(job_id, "Loaded best model from MLflow")
-                except Exception as e:
-                    await self._update_job_log(job_id, f"Warning: Could not load best model from MLflow: {str(e)}")
+                # Check if we actually created a checkpoint during training
+                if val_loader and val_loader.dataset and len(val_loader.dataset) > 0:
+                    # Try to get best model from MLflow
+                    try:
+                        best_model_dict = mlflow.pytorch.load_state_dict("best_model_checkpoint")
+                        model.load_state_dict(best_model_dict)
+                        await self._update_job_log(job_id, "Loaded best model from MLflow")
+                    except Exception as e:
+                        await self._update_job_log(job_id, f"Warning: Could not load best model from MLflow: {str(e)}")
+                else:
+                    await self._update_job_log(job_id, "No validation data was available for early stopping")
             
             # Final evaluation and visualizations
             if len(train_losses) > 0:
@@ -314,27 +319,37 @@ class ImageClassificationPipeline(BasePipeline):
                 )
                 mlflow.log_artifact(acc_curve_path, "visualizations")
             
-            # Create final confusion matrix if validation data was used
-            if val_loader and all_preds and all_targets:
+            # Create final confusion matrix if validation data was used and we have predictions
+            if val_loader and len(all_preds) > 0 and len(all_targets) > 0:
                 from visualization_utils import create_confusion_matrix
                 
-                # Concatenate lists
-                all_preds = torch.cat(all_preds).numpy()
-                all_targets = torch.cat(all_targets).numpy()
-                all_scores = torch.cat(all_scores).numpy()
+                try:
+                    # Concatenate lists
+                    all_preds = torch.cat(all_preds).numpy()
+                    all_targets = torch.cat(all_targets).numpy()
+                    all_scores = torch.cat(all_scores).numpy()
+                except RuntimeError as e:
+                    await self._update_job_log(job_id, f"Warning: Could not concatenate predictions: {e}")
+                    # Continue execution instead of returning which would abort the training
+                    all_preds = None
                 
-                # Create and log confusion matrix
-                cm_path = create_confusion_matrix(
-                    all_targets, 
-                    all_preds,
-                    class_names=classes,
-                    title="Validation Confusion Matrix"
-                )
-                mlflow.log_artifact(cm_path, "visualizations")
-                
-                # Calculate and log final metrics
-                final_metrics = calculate_classification_metrics(all_targets, all_preds, all_scores)
-                log_metrics({"final_" + k: v for k, v in final_metrics.items()})
+                # Only create confusion matrix and calculate metrics if concatenation worked
+                if all_preds is not None:
+                    # Create and log confusion matrix
+                    try:
+                        cm_path = create_confusion_matrix(
+                            all_targets, 
+                            all_preds,
+                            class_names=classes,
+                            title="Validation Confusion Matrix"
+                        )
+                        mlflow.log_artifact(cm_path, "visualizations")
+                        
+                        # Calculate and log final metrics
+                        final_metrics = calculate_classification_metrics(all_targets, all_preds, all_scores)
+                        log_metrics({"final_" + k: v for k, v in final_metrics.items()})
+                    except Exception as e:
+                        await self._update_job_log(job_id, f"Warning: Error creating validation metrics: {e}")
             
             # Create the target directory for MLflow models
             mlflow_models_dir = Path("logs/mlflow/models")

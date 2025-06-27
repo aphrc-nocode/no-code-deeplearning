@@ -24,6 +24,7 @@ import logging
 from mlflow_server import start_mlflow_server, get_mlflow_ui_url
 import os
 import mlflow
+import zipfile
 
 # Import pipeline base class
 from pipelines.base_pipeline import BasePipeline
@@ -66,6 +67,13 @@ class ModelArchitecture(str, Enum):
     RETINANET = "retinanet"
     YOLO = "yolo"
     
+    # Hugging Face transformer object detection architectures
+    DETR_RESNET50 = "detr_resnet50"
+    DETR_RESNET101 = "detr_resnet101"
+    YOLOS_SMALL = "yolos_small"
+    YOLOS_BASE = "yolos_base"
+    OWLV2_BASE = "owlv2_base"
+    
     # Segmentation architectures
     FCN = "fcn"
     DEEPLABV3 = "deeplabv3"
@@ -98,6 +106,11 @@ class PipelineConfig(BaseModel):
     image_size: tuple = (224, 224)
     augmentation_enabled: bool = True
     early_stopping: bool = True
+    patience: int = 5  # Early stopping patience
+    
+    # Hugging Face specific configuration
+    use_hf_transformers: bool = False
+    hf_model_checkpoint: str = None  # Will be set based on architecture selection
     feature_extraction_only: bool = False
     patience: int = 5
     segmentation_type: Optional[SegmentationType] = SegmentationType.SEMANTIC
@@ -113,6 +126,7 @@ class TrainingJob(BaseModel):
     metrics: Dict[str, float] = {}
     model_path: Optional[str] = None
     logs: List[str] = []    
+    linked_dataset_id: Optional[str] = None  # <-- Add this field
 
 
 # ==================== Pipeline Factory ====================
@@ -120,8 +134,23 @@ class TrainingJob(BaseModel):
 class PipelineFactory:
     """Factory to create appropriate pipeline based on task type"""
     
+    # Define mappings from architecture enums to HF model checkpoints
+    HF_MODEL_MAPPING = {
+        ModelArchitecture.DETR_RESNET50: "facebook/detr-resnet-50",
+        ModelArchitecture.DETR_RESNET101: "facebook/detr-resnet-101",
+        ModelArchitecture.YOLOS_SMALL: "hustvl/yolos-small",
+        ModelArchitecture.YOLOS_BASE: "hustvl/yolos-base",
+        ModelArchitecture.OWLV2_BASE: "owlv2-base-patch16-ensemble",
+    }
+    
     @staticmethod
     def create_pipeline(config: PipelineConfig) -> BasePipeline:
+        # Check if using a Hugging Face transformer architecture
+        if config.architecture in PipelineFactory.HF_MODEL_MAPPING:
+            # Set HF-specific configuration
+            config.use_hf_transformers = True
+            config.hf_model_checkpoint = PipelineFactory.HF_MODEL_MAPPING[config.architecture]
+        
         if config.task_type == TaskType.IMAGE_CLASSIFICATION:
             from pipelines.image_classification_pipeline import ImageClassificationPipeline
             return ImageClassificationPipeline(config)
@@ -574,9 +603,12 @@ async def create_pipeline(config: PipelineConfig):
 async def start_training(job_id: str, background_tasks: BackgroundTasks):
     """Start training for a specific job"""
     try:
-        # In a real implementation, dataset_path would come from uploaded files
-        dataset_path = f"datasets/{job_id}"
-        # FIX: Get the result from start_job and return job_id directly
+        job = job_manager.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        if not job.linked_dataset_id:
+            raise HTTPException(status_code=400, detail="No dataset linked to this job. Please link a dataset first.")
+        dataset_path = f"datasets/{job.linked_dataset_id}"
         result = await job_manager.start_job(job_id, dataset_path)
         return result  
     except Exception as e:
@@ -674,21 +706,49 @@ async def create_dataset_class(job_id: str, class_name: str):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/upload-dataset/{job_id}")
-async def upload_dataset_file(job_id: str, file: UploadFile = File(...), class_name: str = Form(...)):
-    """Upload a single file to a specific class directory"""
+async def upload_dataset_file(
+    job_id: str,
+    file: UploadFile = File(...),
+    class_name: str = Form(None),
+    file_type: str = Form("image")  # 'image', 'annotation', or 'zip'
+):
+    """Upload a file to the dataset folder. Supports images, annotation files, and zipped COCO datasets."""
     try:
-        # Ensure class directory exists
-        class_dir = Path(f"datasets/{job_id}/{class_name}")
-        class_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save uploaded file
-        file_path = class_dir / file.filename
-        with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
-        
-        return {"message": f"Uploaded {file.filename} to {class_name} directory"}
-    
+        dataset_dir = Path(f"datasets/{job_id}")
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+
+        if file_type == "zip":
+            # Save and extract zip file
+            zip_path = dataset_dir / file.filename
+            with open(zip_path, "wb") as f:
+                content = await file.read()
+                f.write(content)
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(dataset_dir)
+            zip_path.unlink()  # Remove zip after extraction
+            return {"message": f"Extracted {file.filename} to {dataset_dir}"}
+
+        elif file_type == "annotation" and file.filename.lower().endswith(".json"):
+            # Save annotation file to annotations/ or root
+            annotations_dir = dataset_dir / "annotations"
+            annotations_dir.mkdir(parents=True, exist_ok=True)
+            file_path = annotations_dir / file.filename
+            with open(file_path, "wb") as f:
+                content = await file.read()
+                f.write(content)
+            return {"message": f"Uploaded annotation {file.filename} to {annotations_dir}"}
+
+        else:
+            # Default: treat as image, requires class_name
+            if not class_name:
+                raise HTTPException(status_code=400, detail="class_name is required for image upload.")
+            class_dir = dataset_dir / class_name
+            class_dir.mkdir(parents=True, exist_ok=True)
+            file_path = class_dir / file.filename
+            with open(file_path, "wb") as f:
+                content = await file.read()
+                f.write(content)
+            return {"message": f"Uploaded {file.filename} to {class_name} directory"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -716,7 +776,8 @@ async def predict(job_id: str, file: UploadFile = File(...)):
     
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
+    
+# ==================== Pipeline Management Endpoints ====================
 @app.delete("/pipelines/{job_id}")
 async def delete_pipeline(job_id: str):
     """Delete a training job and its associated resources"""
@@ -733,3 +794,197 @@ async def health_check():
         "timestamp": datetime.now(),
         "active_jobs": len(job_manager.running_jobs)
     }
+
+@app.get("/datasets/available")
+async def list_available_datasets():
+    """List all available datasets"""
+    try:
+        dataset_dir = Path("datasets")
+        if not dataset_dir.exists():
+            return []
+        
+        datasets = []
+        for d in dataset_dir.iterdir():
+            if d.is_dir():
+                # Skip special directories
+                if d.name.startswith('.') or d.name == '__pycache__':
+                    continue
+                
+                # Try to determine the task type based on directory structure or content
+                task_type = "image_classification"  # Default
+                is_coco_dataset = False
+                
+                # Check for COCO format (annotations directory or JSON files)
+                annotations_dir = d / "annotations"
+                if annotations_dir.exists() and annotations_dir.is_dir():
+                    json_files = list(annotations_dir.glob("*.json"))
+                    if json_files:
+                        is_coco_dataset = True
+                        task_type = "object_detection"
+                
+                # Also check for JSON files in the root directory that might be COCO annotations
+                if not is_coco_dataset:
+                    json_files = list(d.glob("*.json"))
+                    for json_file in json_files:
+                        try:
+                            with open(json_file, 'r') as f:
+                                content = json.load(f)
+                                # Simple check for COCO format
+                                if all(key in content for key in ["images", "annotations", "categories"]):
+                                    is_coco_dataset = True
+                                    task_type = "object_detection"
+                                    break
+                        except:
+                            continue
+                
+                # Look for directory structure indicators
+                if not is_coco_dataset and "detection" in d.name.lower():
+                    task_type = "object_detection"
+                elif "segmentation" in d.name.lower():
+                    task_type = "image_segmentation"
+                
+                # Check for class directories (for classification datasets)
+                classes = [c.name for c in d.iterdir() if c.is_dir() and not c.name == "annotations"]
+                
+                # Count items (images) in the dataset
+                item_count = 0
+                if is_coco_dataset:
+                    # For COCO datasets, count all images in the dataset recursively
+                    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
+                    for ext in image_extensions:
+                        found_images = list(d.glob(f"**/*{ext}"))
+                        item_count += len(found_images)
+                    
+                    # If still 0, try a more comprehensive search (might be slower but more reliable)
+                    if item_count == 0:
+                        import glob
+                        for ext in image_extensions:
+                            found_images = glob.glob(str(d) + f"/**/*{ext}", recursive=True)
+                            item_count += len(found_images)
+                    
+                    # Print debug info
+                    print(f"Found {item_count} images in COCO dataset: {d.name}")
+                    
+                    # Try to get class names from the COCO annotations
+                    if not classes:
+                        # Use either json_files from annotations dir or the ones found in root
+                        coco_jsons = json_files if json_files else list(d.glob("**/*.json"))
+                        for json_file in coco_jsons:
+                            try:
+                                with open(json_file, 'r') as f:
+                                    content = json.load(f)
+                                    if "categories" in content:
+                                        classes = [cat["name"] for cat in content["categories"]]
+                                        print(f"Found {len(classes)} classes in COCO dataset: {d.name}")
+                                        break
+                            except Exception as e:
+                                print(f"Error parsing JSON {json_file}: {str(e)}")
+                                continue
+                else:
+                    # For classification datasets, count by class
+                    if classes:
+                        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
+                        for cls in classes:
+                            class_path = d / cls
+                            image_files = [f for f in class_path.iterdir() 
+                                        if f.is_file() and any(f.name.lower().endswith(ext) for ext in image_extensions)]
+                            item_count += len(image_files)
+                
+                # Skip empty datasets - for COCO datasets, we don't require classes to be detected
+                if not is_coco_dataset and not classes:
+                    continue
+                
+                # For COCO datasets with no detected images, skip as well
+                if is_coco_dataset and item_count == 0:
+                    print(f"Skipping COCO dataset with no images: {d.name}")
+                    continue
+                
+                datasets.append({
+                    "id": d.name,
+                    "name": d.name.replace('_', ' ').title(),
+                    "classes": classes if classes else ["(COCO format dataset)"],
+                    "task_type": task_type,
+                    "item_count": item_count,
+                    "is_coco_format": is_coco_dataset
+                })
+        
+        return datasets
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing datasets: {str(e)}")
+
+@app.post("/pipelines/{job_id}/dataset/{dataset_id}")
+async def link_dataset_to_job(job_id: str, dataset_id: str):
+    """Link an existing dataset to a job"""
+    try:
+        # Check if job exists
+        job = job_manager.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        
+        # Check if dataset exists
+        dataset_path = Path(f"datasets/{dataset_id}")
+        
+        # Debug info
+        print(f"Linking dataset: {dataset_id}")
+        print(f"Dataset path: {dataset_path}")
+        print(f"Dataset path exists: {dataset_path.exists()}")
+        print(f"Dataset path is directory: {dataset_path.is_dir() if dataset_path.exists() else False}")
+        
+        # List all datasets to debug
+        all_datasets = [d.name for d in Path("datasets").iterdir() if d.is_dir()]
+        print(f"Available datasets: {all_datasets}")
+        
+        if not dataset_path.exists() or not dataset_path.is_dir():
+            raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found")
+        
+        # Store the linked dataset ID in the job
+        job.linked_dataset_id = dataset_id
+        return {"message": f"Successfully linked dataset {dataset_id} to job {job_id}"}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to link dataset: {str(e)}")
+
+@app.post("/upload-detection-dataset/{job_id}")
+async def upload_detection_dataset(job_id: str, file: UploadFile = File(...)):
+    """
+    Upload a COCO format object detection dataset as a zip file.
+    The zip file should contain the images and annotations in the COCO format structure.
+    The entire structure is preserved when extracting.
+    """
+    try:
+        dataset_dir = Path(f"datasets/{job_id}")
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Verify that the uploaded file is a zip file
+        if not file.filename.lower().endswith(('.zip')):
+            raise HTTPException(status_code=400, detail="Only ZIP files are supported for object detection datasets")
+        
+        # Save the zip file temporarily
+        zip_path = dataset_dir / file.filename
+        with open(zip_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        # Extract the zip file, preserving the directory structure
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(dataset_dir)
+        
+        # Delete the temporary zip file
+        zip_path.unlink()
+        
+        return {
+            "message": f"Object detection dataset uploaded and extracted successfully to {dataset_dir}",
+            "dataset_id": job_id,
+            "task_type": "object_detection"
+        }
+    except Exception as e:
+        # If something goes wrong, delete any partial files
+        if dataset_dir.exists():
+            import shutil
+            try:
+                if zip_path.exists():
+                    zip_path.unlink()
+            except:
+                pass
+        raise HTTPException(status_code=400, detail=f"Failed to process dataset: {str(e)}")
