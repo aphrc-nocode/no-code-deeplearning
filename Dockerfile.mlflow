@@ -1,0 +1,23 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install dependencies
+RUN pip install --no-cache-dir mlflow==3.1.0 psycopg2-binary==2.9.9
+
+# Create necessary directories
+RUN mkdir -p /mlruns /mlflow-logs
+
+# Expose the port for MLflow
+EXPOSE 5000
+
+# Set environment variable
+ENV MLFLOW_TRACKING_URI=http://localhost:5000
+
+# Command to run MLflow server
+CMD ["mlflow", "server", "--host", "0.0.0.0", "--port", "5000", "--default-artifact-root", "/mlruns"]

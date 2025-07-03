@@ -1,0 +1,52 @@
+# First, let's clean up the .gitignore file
+cat > .gitignore << 'EOF'
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.pyc
+
+# Project specific directories
+datasets/
+logs/
+test_data/
+temp/
+dataset_splits/
+mlruns/
+
+# Model files
+*.pth
+*.pkl
+*.pt
+*.ckpt
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Log files
+*.log
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Gradio cache
+.gradio/
+EOF

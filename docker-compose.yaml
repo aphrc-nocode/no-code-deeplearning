@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    shm_size: 2gb
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+      - ./datasets:/app/datasets
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    depends_on:
+      - mlflow
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/mlruns
+      - ./logs/mlflow:/mlflow-logs
+    env_file:
+      - .env
+    networks:
+      - ai-network
+    command: >
+      mlflow server 
+      --host 0.0.0.0 
+      --port ${MLFLOW_PORT:-5000} 
+      --default-artifact-root /mlruns
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/2.0/mlflow/experiments/list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  ai-network:
+    driver: bridge
+
+volumes:
+  mlruns:
+  models:
+  datasets:
+  logs:
